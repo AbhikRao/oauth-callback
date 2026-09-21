@@ -134,10 +134,14 @@ describe("fileStore", () => {
   });
 
   test("serializes concurrent mutations without losing keys", async () => {
-    const entries = Array.from({ length: 8 }, (_, index) => [
-      `account-${index}`,
-      { accessToken: `access-token-${index}` } satisfies Tokens,
-    ] as const);
+    const entries = Array.from(
+      { length: 8 },
+      (_, index) =>
+        [
+          `account-${index}`,
+          { accessToken: `access-token-${index}` } satisfies Tokens,
+        ] as const,
+    );
 
     await Promise.all(entries.map(([key, tokens]) => store.set(key, tokens)));
 
