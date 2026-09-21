@@ -2,7 +2,15 @@
 /* SPDX-License-Identifier: MIT */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TokenStore, Tokens } from "../src/mcp-types";
@@ -123,6 +131,83 @@ describe("fileStore", () => {
     await store.delete("missing");
 
     expect(await store.get("account")).toEqual(primaryTokens);
+  });
+
+  test("serializes concurrent mutations without losing keys", async () => {
+    const entries = Array.from(
+      { length: 8 },
+      (_, index) =>
+        [
+          `account-${index}`,
+          { accessToken: `access-token-${index}` } satisfies Tokens,
+        ] as const,
+    );
+
+    await Promise.all(entries.map(([key, tokens]) => store.set(key, tokens)));
+
+    for (const [key, tokens] of entries) {
+      expect(await store.get(key)).toEqual(tokens);
+    }
+
+    const persisted = JSON.parse(await readFile(filepath, "utf-8"));
+    expect(Object.keys(persisted).sort()).toEqual(
+      entries.map(([key]) => key).sort(),
+    );
+
+    const files = await readdir(join(tempDir, "nested"));
+    expect(files.filter((name) => name.includes(".tmp."))).toEqual([]);
+  });
+
+  test("serializes concurrent sets and deletes", async () => {
+    await store.set("removed", primaryTokens);
+
+    await Promise.all([
+      store.set("kept", replacementTokens),
+      store.delete("removed"),
+    ]);
+
+    expect(JSON.parse(await readFile(filepath, "utf-8"))).toEqual({
+      kept: replacementTokens,
+    });
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "creates owner-only token files and directories",
+    async () => {
+      await store.set("account", primaryTokens);
+
+      expect((await stat(filepath)).mode & 0o777).toBe(0o600);
+      expect((await stat(join(tempDir, "nested"))).mode & 0o777).toBe(0o700);
+    },
+  );
+
+  test("removes temporary files when the final rename fails", async () => {
+    await mkdir(filepath, { recursive: true });
+
+    let error: unknown;
+    try {
+      await store.set("account", primaryTokens);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeDefined();
+
+    const files = await readdir(join(tempDir, "nested"));
+    expect(files.filter((name) => name.startsWith("tokens.json.tmp."))).toEqual(
+      [],
+    );
+  });
+
+  test("continues processing mutations after a failed write", async () => {
+    await mkdir(filepath, { recursive: true });
+
+    await expect(store.set("first", primaryTokens)).rejects.toThrow();
+
+    await rm(filepath, { recursive: true, force: true });
+    await store.set("second", replacementTokens);
+
+    expect(await store.get("second")).toEqual(replacementTokens);
   });
 
   test("recovers from invalid JSON on the next write", async () => {
