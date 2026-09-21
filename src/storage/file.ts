@@ -18,7 +18,8 @@ export function fileStore(filepath?: string): TokenStore {
   let mutationQueue: Promise<void> = Promise.resolve();
 
   async function ensureDir() {
-    await fs.mkdir(path.dirname(file), { recursive: true });
+    // Owner-only; applies only to directories created here.
+    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   }
 
   async function readStore(): Promise<Record<string, Tokens>> {

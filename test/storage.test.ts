@@ -158,14 +158,28 @@ describe("fileStore", () => {
     expect(files.filter((name) => name.includes(".tmp."))).toEqual([]);
   });
 
-  test("creates token files with owner-only permissions", async () => {
-    await store.set("account", primaryTokens);
+  test("serializes concurrent sets and deletes", async () => {
+    await store.set("removed", primaryTokens);
 
-    if (process.platform !== "win32") {
-      const info = await stat(filepath);
-      expect(info.mode & 0o777).toBe(0o600);
-    }
+    await Promise.all([
+      store.set("kept", replacementTokens),
+      store.delete("removed"),
+    ]);
+
+    expect(JSON.parse(await readFile(filepath, "utf-8"))).toEqual({
+      kept: replacementTokens,
+    });
   });
+
+  test.skipIf(process.platform === "win32")(
+    "creates owner-only token files and directories",
+    async () => {
+      await store.set("account", primaryTokens);
+
+      expect((await stat(filepath)).mode & 0o777).toBe(0o600);
+      expect((await stat(join(tempDir, "nested"))).mode & 0o777).toBe(0o700);
+    },
+  );
 
   test("removes temporary files when the final rename fails", async () => {
     await mkdir(filepath, { recursive: true });
@@ -180,9 +194,9 @@ describe("fileStore", () => {
     expect(error).toBeDefined();
 
     const files = await readdir(join(tempDir, "nested"));
-    expect(
-      files.filter((name) => name.startsWith("tokens.json.tmp.")),
-    ).toEqual([]);
+    expect(files.filter((name) => name.startsWith("tokens.json.tmp."))).toEqual(
+      [],
+    );
   });
 
   test("continues processing mutations after a failed write", async () => {
