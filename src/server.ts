@@ -269,6 +269,9 @@ class DenoCallbackServer extends BaseCallbackServer {
  */
 class NodeCallbackServer extends BaseCallbackServer {
   private server?: HttpServer;
+  // Settles once the callback page is flushed or its connection drops.
+  private callbackResponseDone?: Promise<void>;
+  private stopping?: Promise<void>;
 
   public async start(options: ServerOptions): Promise<void> {
     this.setup(options);
@@ -280,6 +283,13 @@ class NodeCallbackServer extends BaseCallbackServer {
         try {
           const request = this.nodeToWebRequest(req, port, hostname);
           const response = this.handleRequest(request);
+
+          // Set synchronously: stop() can run as soon as the listener resolves.
+          if (this.callbackReceived && !this.callbackResponseDone) {
+            this.callbackResponseDone = new Promise((resolve) =>
+              res.once("close", () => resolve()),
+            );
+          }
 
           res.shouldKeepAlive = false;
 
@@ -300,14 +310,25 @@ class NodeCallbackServer extends BaseCallbackServer {
     });
   }
 
-  protected async stopServer(): Promise<void> {
-    if (!this.server) return;
-    return new Promise((resolve) => {
-      this.server?.close(() => {
-        this.server = undefined;
-        resolve();
-      });
-    });
+  // Shared so abort-triggered and finally-block stops both await full cleanup.
+  // Not cached before the server exists: an abort during start() must not
+  // turn the later stop() into a no-op.
+  protected stopServer(): Promise<void> {
+    const server = this.server;
+    if (!server) return Promise.resolve();
+    return (this.stopping ??= this.closeServer(server));
+  }
+
+  private async closeServer(server: HttpServer): Promise<void> {
+    const closed = new Promise<void>((resolve) =>
+      server.close(() => resolve()),
+    );
+    // Force-closing earlier truncates the callback page (#25).
+    await this.callbackResponseDone;
+    // close() alone waits on sockets that never send a request,
+    // e.g. browser preconnects (#35).
+    server.closeAllConnections();
+    await closed;
   }
 
   /**
