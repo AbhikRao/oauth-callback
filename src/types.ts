@@ -98,5 +98,4 @@ type GetAuthCodeOptionsManaged = GetAuthCodeOptionsBase & {
 };
 
 export type GetAuthCodeOptions =
-  | GetAuthCodeOptionsHeadless
-  | GetAuthCodeOptionsManaged;
+  GetAuthCodeOptionsHeadless | GetAuthCodeOptionsManaged;
