@@ -56,6 +56,12 @@ describe("inMemoryStore", () => {
     expect(await store.get("first")).toBeNull();
     expect(await store.get("second")).toEqual(replacementTokens);
   });
+
+  test("keeps separate instances independent", async () => {
+    await store.set("account", primaryTokens);
+
+    expect(await inMemoryStore().get("account")).toBeNull();
+  });
 });
 
 describe("fileStore", () => {
@@ -89,12 +95,12 @@ describe("fileStore", () => {
 
   test("overwrites one key without changing another", async () => {
     await store.set("first", primaryTokens);
-    await store.set("second", replacementTokens);
+    await store.set("second", primaryTokens);
 
     await store.set("first", replacementTokens);
 
     expect(await store.get("first")).toEqual(replacementTokens);
-    expect(await store.get("second")).toEqual(replacementTokens);
+    expect(await store.get("second")).toEqual(primaryTokens);
   });
 
   test("deletes only the requested key", async () => {
@@ -109,6 +115,14 @@ describe("fileStore", () => {
     const persisted = JSON.parse(await readFile(filepath, "utf-8"));
     expect(persisted.first).toBeUndefined();
     expect(persisted.second).toEqual(replacementTokens);
+  });
+
+  test("deleting a missing key is a no-op", async () => {
+    await store.set("account", primaryTokens);
+
+    await store.delete("missing");
+
+    expect(await store.get("account")).toEqual(primaryTokens);
   });
 
   test("recovers from invalid JSON on the next write", async () => {
