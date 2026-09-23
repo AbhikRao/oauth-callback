@@ -265,23 +265,38 @@ describe("browserAuth concurrency", () => {
 });
 
 describe("browserAuth state validation", () => {
-  test("rejects callback with mismatched state", async () => {
+  test("passes expected state to the callback handler", async () => {
+    let capturedExpectedState: string | undefined;
+
     const { mock } = await import("bun:test");
     mock.module("../index", () => ({
-      getAuthCode: async () => ({
-        code: "test-code",
-        state: "wrong-state",
+      getAuthCode: async (options: { expectedState?: string }) => {
+        capturedExpectedState = options.expectedState;
+        return {
+          code: "test-code",
+          state: "expected-state",
+        };
+      },
+    }));
+    mock.module("@modelcontextprotocol/sdk/client/auth.js", () => ({
+      exchangeAuthorization: async () => ({
+        access_token: "test-token",
+        token_type: "Bearer",
       }),
+      discoverAuthorizationServerMetadata: async () => undefined,
     }));
 
     const { browserAuth: mockedBrowserAuth } = await import("./browser-auth");
     const provider = mockedBrowserAuth({ clientId: "test-client" });
+    await provider.saveCodeVerifier("test-verifier");
 
     const authUrl = new URL("https://example.com/auth?state=expected-state");
 
-    await expect(provider.redirectToAuthorization(authUrl)).rejects.toThrow(
-      "OAuth state mismatch",
-    );
+    await provider.redirectToAuthorization(authUrl);
+
+    // getAuthCode owns state validation now, so mismatches are ignored while
+    // the callback server keeps waiting instead of ending the auth flow.
+    expect(capturedExpectedState).toBe("expected-state");
   });
 
   test("accepts callback with matching state", async () => {

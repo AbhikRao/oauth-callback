@@ -30,6 +30,7 @@ The function accepts either:
 | `port`             | `number`                   | `3000`        | Port for the local callback server            |
 | `hostname`         | `string`                   | `"localhost"` | Hostname to bind the server to                |
 | `callbackPath`     | `string`                   | `"/callback"` | URL path for OAuth callback                   |
+| `expectedState`    | `string`                   | _none_        | Required state value for callback validation  |
 | `timeout`          | `number`                   | `30000`       | Timeout in milliseconds                       |
 | `launch`           | `(url: string) => unknown` | _none_        | Optional callback to launch auth URL          |
 | `successHtml`      | `string`                   | _built-in_    | Custom HTML for successful auth               |
@@ -372,12 +373,12 @@ async function getAuthCodeWithRetry(
 
 ### State Parameter Validation
 
-Always validate the state parameter to prevent CSRF attacks:
+Use `expectedState` to validate state before a callback is allowed to finish the flow:
 
 ```typescript
 import { randomBytes } from "crypto";
+import open from "open";
 
-// Generate secure random state
 const state = randomBytes(32).toString("base64url");
 
 const authUrl = new URL("https://oauth.example.com/authorize");
@@ -386,16 +387,22 @@ authUrl.searchParams.set("redirect_uri", "http://localhost:3000/callback");
 authUrl.searchParams.set("state", state);
 authUrl.searchParams.set("scope", "read write");
 
-const result = await getAuthCode(authUrl.toString());
+const result = await getAuthCode({
+  authorizationUrl: authUrl.toString(),
+  launch: open,
+  expectedState: state,
+});
 
-// Validate state matches
-if (result.state !== state) {
-  throw new Error("State mismatch - possible CSRF attack!");
-}
-
-// Safe to use authorization code
 console.log("Valid authorization code:", result.code);
 ```
+
+When `expectedState` is set, a callback must contain exactly one matching
+`state` value. Mismatched, missing, or duplicate state values receive HTTP
+400 and are ignored; the listener keeps waiting until the original timeout.
+
+The callback itself must also contain exactly one non-empty `code` with no
+`error`, or exactly one non-empty `error` with no `code`. Invalid callback
+shapes do not end the authorization flow.
 
 ### PKCE Implementation
 

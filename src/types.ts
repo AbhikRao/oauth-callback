@@ -27,6 +27,12 @@ interface GetAuthCodeOptionsBase {
   callbackPath?: string;
 
   /**
+   * Expected OAuth state value. When set, callbacks without exactly one matching
+   * state parameter are rejected with HTTP 400 and the listener keeps waiting.
+   */
+  expectedState?: string;
+
+  /**
    * Timeout in milliseconds to wait for OAuth callback.
    * Starts when the callback server is ready; launch timing does not delay it.
    * @default 30000

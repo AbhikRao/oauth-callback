@@ -287,6 +287,7 @@ class BrowserOAuthProvider implements OAuthClientProvider {
       port: this._port,
       hostname: this._hostname,
       callbackPath: this._callbackPath,
+      expectedState: authorizationUrl.searchParams.get("state") ?? undefined,
       timeout: this._authTimeout,
       successHtml: this._successHtml,
       errorHtml: this._errorHtml,
@@ -307,13 +308,6 @@ class BrowserOAuthProvider implements OAuthClientProvider {
     // check for the edge case where neither code nor error is present.
     if (!result.code) {
       throw new Error("No authorization code received");
-    }
-
-    // Validate state from callback against the URL we were given (CSRF protection).
-    // Works regardless of whether state() was used - validates whatever is in the URL.
-    const expectedState = authorizationUrl.searchParams.get("state");
-    if (expectedState && result.state !== expectedState) {
-      throw new Error("OAuth state mismatch - possible CSRF attack");
     }
 
     /**

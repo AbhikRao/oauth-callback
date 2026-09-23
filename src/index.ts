@@ -102,6 +102,7 @@ export async function getAuthCode(
     hostname = DEFAULT_HOSTNAME,
     timeout = 30000,
     callbackPath = DEFAULT_CALLBACK_PATH,
+    expectedState,
     successHtml,
     errorHtml,
     signal,
@@ -132,7 +133,11 @@ export async function getAuthCode(
       );
     }
 
-    const result = await server.waitForCallback(callbackPath, timeout);
+    const result = await server.waitForCallback(
+      callbackPath,
+      timeout,
+      expectedState,
+    );
 
     // OAuth errors must be thrown, not returned
     if (result.error) {
