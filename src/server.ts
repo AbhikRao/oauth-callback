@@ -114,7 +114,8 @@ function parseCallback(
 ): CallbackResult | undefined {
   const codes = url.searchParams.getAll("code");
   const errors = url.searchParams.getAll("error");
-  const validCode =\n    codes.length === 1 && codes[0] !== "" && errors.length === 0;
+  const validCode =
+    codes.length === 1 && codes[0] !== "" && errors.length === 0;
   const validError =
     errors.length === 1 && errors[0] !== "" && codes.length === 0;
 
