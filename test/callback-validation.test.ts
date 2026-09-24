@@ -51,9 +51,8 @@ describe("callback validation", () => {
     const result = await resultPromise;
     await launchWork;
 
-    expect(statuses.slice(0, -1)).toEqual([
-      400, 400, 400, 400, 400, 400, 400,
-    ]);
+    const invalidStatuses = statuses.slice(0, -1);
+    expect(invalidStatuses).toEqual([400, 400, 400, 400, 400, 400, 400]);
     expect(statuses.at(-1)).toBe(200);
     expect(result.code).toBe("valid-code");
     expect(result.state).toBe("expected-state");
