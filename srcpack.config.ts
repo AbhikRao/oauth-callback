@@ -27,5 +27,7 @@ export default defineConfig({
     docs: "docs/**/*",
     // Usage examples (GitHub, Notion OAuth demos)
     examples: "examples/**/*",
+    // For review
+    review: ["git:origin/main...HEAD", "git:staged"],
   },
 });

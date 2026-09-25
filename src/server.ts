@@ -121,10 +121,10 @@ function parseCallback(
 
   if (!validCode && !validError) return undefined;
 
-  if (expectedState !== undefined) {
-    const states = url.searchParams.getAll("state");
-    if (states.length !== 1 || states[0] !== expectedState) return undefined;
-  }
+  const states = url.searchParams.getAll("state");
+  if (states.length > 1) return undefined;
+  if (expectedState !== undefined && states[0] !== expectedState)
+    return undefined;
 
   const params: CallbackResult = {};
   for (const [key, value] of url.searchParams) params[key] = value;
@@ -187,19 +187,15 @@ abstract class BaseCallbackServer implements CallbackServer {
     if (!listener) return new Response("Not Found", { status: 404 });
 
     const params = parseCallback(url, listener.expectedState);
-    if (!params) {
-      const invalid: CallbackResult = {
-        error: "invalid_callback",
-        error_description: "Invalid OAuth callback parameters",
-      };
+    // Plain text, not the error page: the real authorization may still succeed in another tab.
+    if (!params)
       return new Response(
-        generateCallbackHTML(invalid, this.successHtml, this.errorHtml),
+        "This callback does not match the active authorization request. You can close this tab.",
         {
           status: 400,
-          headers: { "Content-Type": "text/html" },
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
         },
       );
-    }
 
     // Resolve only after the callback shape and optional state have been validated.
     listener.resolve(params);

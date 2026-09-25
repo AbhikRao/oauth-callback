@@ -56,7 +56,7 @@ interface GetAuthCodeOptions {
   hostname?: string; // Hostname (default: "localhost")
   callbackPath?: string; // Callback path (default: "/callback")
   timeout?: number; // Timeout in ms (default: 30000)
-  launch?: (url: string) => unknown; // Optional URL launcher
+  launch: boolean | ((authorizationUrl: string) => unknown); // true: system browser, false: caller shows URL
   successHtml?: string; // Custom success HTML
   errorHtml?: string; // Custom error HTML template
   signal?: AbortSignal; // Cancellation signal
@@ -71,11 +71,12 @@ import type { GetAuthCodeOptions } from "oauth-callback";
 
 const options: GetAuthCodeOptions = {
   authorizationUrl: "https://oauth.example.com/authorize?...",
+  launch: true,
   port: 8080,
   timeout: 60000,
   successHtml: "<h1>Success!</h1>",
   errorHtml: "<h1>Error: {{error_description}}</h1>",
-  onRequest: (req) => console.log(`Request: ${req.url}`),
+  onRequest: (req) => console.log(`Request: ${new URL(req.url).pathname}`),
 };
 
 const result = await getAuthCode(options);
@@ -384,7 +385,7 @@ interface BrowserAuthOptions {
   storeKey?: string; // Storage key for token isolation
 
   // Behavior
-  launch?: (url: string) => unknown; // URL launcher
+  launch?: (authorizationUrl: string) => unknown; // Default: system browser
   authTimeout?: number; // Timeout ms (default: 300000)
 
   // UI

@@ -46,9 +46,9 @@ const result = await getAuthCode({
   launch: open,
 });
 
-// Headless/CI environments - omit launch, print URL manually
+// Manual launch - print URL for the user to open
 console.log(`Please open: ${url}`);
-const result = await getAuthCode({ authorizationUrl: url });
+const result = await getAuthCode({ authorizationUrl: url, launch: false });
 
 // Custom browser handling
 const result = await getAuthCode({
@@ -122,15 +122,15 @@ This pattern ensures your callback server is always ready, even if the browser t
 
 ## Testing Without Real Browsers
 
-Automated testing shouldn't spawn actual browser windows. Simply omit the `launch` callback:
+Automated testing shouldn't spawn actual browser windows. Pass `launch: false`:
 
 ```typescript
-// In tests - omit launch to prevent browser
+// In tests - no browser
 const mockProvider = new MockOAuthProvider();
 
 const result = await getAuthCode({
   authorizationUrl: mockProvider.authUrl,
-  // No launch - tests simulate OAuth redirect directly
+  launch: false, // Tests simulate the OAuth redirect directly
   port: 0, // Use random available port
 });
 

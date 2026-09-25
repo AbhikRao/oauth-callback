@@ -185,10 +185,11 @@ test("successful authorization with string input", async () => {
 });
 
 test("timeout throws TimeoutError", async () => {
-  // Headless mode: no authorizationUrl, no launch — just wait for callback
   let errorThrown = false;
   try {
     await getAuthCode({
+      authorizationUrl: "https://example.com/authorize",
+      launch: false,
       port: 3004,
       timeout: 100,
     });
@@ -209,8 +210,9 @@ test("abort signal handling", async () => {
 
   let errorThrown = false;
   try {
-    // Headless mode: no authorizationUrl, no launch — just wait for callback
     await getAuthCode({
+      authorizationUrl: "https://example.com/authorize",
+      launch: false,
       port: 3005,
       signal: controller.signal,
     });
@@ -279,8 +281,9 @@ test("server cleanup on early stop", async () => {
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 10);
 
-    // Headless mode: no authorizationUrl, no launch — just wait for callback
     await getAuthCode({
+      authorizationUrl: "https://example.com/authorize",
+      launch: false,
       port: 3008,
       signal: controller.signal,
     });

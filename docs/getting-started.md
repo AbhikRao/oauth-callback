@@ -22,31 +22,30 @@ Install the package using your preferred package manager:
 ::: code-group
 
 ```bash [Bun]
-bun add oauth-callback open
+bun add oauth-callback
 ```
 
 ```bash [npm]
-npm install oauth-callback open
+npm install oauth-callback
 ```
 
 ```bash [pnpm]
-pnpm add oauth-callback open
+pnpm add oauth-callback
 ```
 
 ```bash [Yarn]
-yarn add oauth-callback open
+yarn add oauth-callback
 ```
 
 :::
 
-> **Note:** The `open` package is optional but recommended for launching the browser. Omit it for headless environments.
+> **Note:** A browser launcher is bundled: pass `launch: true` to open the system browser, or `launch: false` to show the URL yourself.
 
 ## Basic Usage
 
 The simplest way to capture an OAuth authorization code is with the `getAuthCode()` function:
 
 ```typescript
-import open from "open";
 import { getAuthCode } from "oauth-callback";
 
 // Construct your OAuth authorization URL
@@ -59,8 +58,8 @@ const authUrl =
     state: crypto.randomUUID(), // For CSRF protection
   });
 
-// Get the authorization code (launch: open opens the browser)
-const result = await getAuthCode({ authorizationUrl: authUrl, launch: open });
+// Get the authorization code (launch: true opens the system browser)
+const result = await getAuthCode({ authorizationUrl: authUrl, launch: true });
 
 console.log("Authorization code:", result.code);
 console.log("State:", result.state);
@@ -109,7 +108,6 @@ First, register your application with your OAuth provider:
 Create a file `auth.ts` with your OAuth implementation:
 
 ```typescript
-import open from "open";
 import { getAuthCode, OAuthError } from "oauth-callback";
 
 async function authenticate() {
@@ -128,13 +126,8 @@ async function authenticate() {
     console.log("Opening browser for authentication...");
     const result = await getAuthCode({
       authorizationUrl: authUrl.toString(),
-      launch: open,
+      launch: true,
     });
-
-    // Validate state
-    if (result.state !== state) {
-      throw new Error("State mismatch - possible CSRF attack");
-    }
 
     console.log("✅ Authorization successful!");
     return result.code;
@@ -222,14 +215,12 @@ For Model Context Protocol applications, use the `browserAuth()` provider for se
 ### Quick Setup
 
 ```typescript
-import open from "open";
 import { browserAuth, inMemoryStore } from "oauth-callback/mcp";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 // Create OAuth provider for MCP
 const authProvider = browserAuth({
-  launch: open,
   store: inMemoryStore(), // Or fileStore() for persistence
   scope: "read write",
 });
@@ -255,29 +246,24 @@ Choose between ephemeral and persistent token storage:
 ::: code-group
 
 ```typescript [Ephemeral (Memory)]
-import open from "open";
 import { browserAuth, inMemoryStore } from "oauth-callback/mcp";
 
 // Tokens are lost when the process exits
 const authProvider = browserAuth({
-  launch: open,
   store: inMemoryStore(),
 });
 ```
 
 ```typescript [Persistent (File)]
-import open from "open";
 import { browserAuth, fileStore } from "oauth-callback/mcp";
 
 // Tokens persist across sessions
 const authProvider = browserAuth({
-  launch: open,
   store: fileStore(), // Saves to ~/.mcp/tokens.json
 });
 
 // Or specify custom location
 const customAuth = browserAuth({
-  launch: open,
   store: fileStore("/path/to/tokens.json"),
 });
 ```
@@ -289,13 +275,10 @@ const customAuth = browserAuth({
 If you have pre-registered OAuth credentials:
 
 ```typescript
-import open from "open";
-
 const authProvider = browserAuth({
   clientId: "your-client-id",
   clientSecret: "your-client-secret",
   scope: "read write",
-  launch: open,
   store: fileStore(),
   storeKey: "my-app", // Namespace for multiple apps
 });
@@ -310,6 +293,7 @@ Configure the callback server port and timeout:
 ```typescript
 const result = await getAuthCode({
   authorizationUrl: authUrl,
+  launch: true,
   port: 8080, // Use port 8080 instead of 3000
   timeout: 60000, // 60 second timeout (default: 30s)
   hostname: "127.0.0.1", // Bind to specific IP
@@ -323,6 +307,7 @@ Customize the success and error pages shown to users:
 ```typescript
 const result = await getAuthCode({
   authorizationUrl: authUrl,
+  launch: true,
   successHtml: `
     <html>
       <body style="font-family: system-ui; text-align: center; padding: 50px;">
@@ -350,9 +335,10 @@ Add logging for debugging OAuth flows:
 ```typescript
 const result = await getAuthCode({
   authorizationUrl: authUrl,
+  launch: true,
   onRequest: (req) => {
-    console.log(`[OAuth] ${req.method} ${req.url}`);
-    console.log("[OAuth] Headers:", Object.fromEntries(req.headers));
+    // Path only: the callback query carries the authorization code
+    console.log(`[OAuth] ${req.method} ${new URL(req.url).pathname}`);
   },
 });
 ```
@@ -376,10 +362,11 @@ process.on("SIGINT", () => {
 try {
   const result = await getAuthCode({
     authorizationUrl: authUrl,
+    launch: true,
     signal: controller.signal,
   });
 } catch (error) {
-  if (error.message === "Operation aborted") {
+  if (controller.signal.aborted) {
     console.log("OAuth flow was cancelled");
   }
 }
@@ -390,11 +377,10 @@ try {
 Proper error handling ensures a good user experience:
 
 ```typescript
-import open from "open";
-import { getAuthCode, OAuthError } from "oauth-callback";
+import { getAuthCode, OAuthError, TimeoutError } from "oauth-callback";
 
 try {
-  const result = await getAuthCode({ authorizationUrl: authUrl, launch: open });
+  const result = await getAuthCode({ authorizationUrl: authUrl, launch: true });
   // Success path
 } catch (error) {
   if (error instanceof OAuthError) {
@@ -412,10 +398,8 @@ try {
       default:
         console.error(`OAuth error: ${error.error_description || error.error}`);
     }
-  } else if (error.message === "Timeout waiting for callback") {
+  } else if (error instanceof TimeoutError) {
     console.error("Authorization timed out - please try again");
-  } else if (error.message === "Operation aborted") {
-    console.error("Authorization was cancelled");
   } else {
     console.error("Unexpected error:", error);
   }
@@ -426,17 +410,14 @@ try {
 
 ### Always Use State Parameter
 
-Protect against CSRF attacks with a state parameter:
+Protect against CSRF attacks with a state parameter. `getAuthCode` reads it
+from the authorization URL and ignores callbacks that don't echo it:
 
 ```typescript
 const state = crypto.randomUUID();
 
 const authUrl = `https://example.com/authorize?state=${state}&...`;
 const result = await getAuthCode(authUrl);
-
-if (result.state !== state) {
-  throw new Error("State mismatch - possible CSRF attack");
-}
 ```
 
 ### Implement PKCE for Public Clients
@@ -521,6 +502,7 @@ If port 3000 is already in use:
 ```typescript
 const result = await getAuthCode({
   authorizationUrl: authUrl,
+  launch: true,
   port: 8080, // Use a different port
 });
 ```
@@ -529,12 +511,16 @@ Also update your OAuth app's redirect URI to match.
 :::
 
 ::: details Browser Doesn't Open
-If you're in a headless environment or the browser doesn't open:
+If the browser doesn't open, show the URL yourself:
 
 ```typescript
-// Headless mode - print URL for manual opening
+// Manual launch - print URL for the user to open
 console.log(`Please open: ${authUrl}`);
-const result = await getAuthCode({ port: 3000, timeout: 120000 });
+const result = await getAuthCode({
+  authorizationUrl: authUrl,
+  launch: false,
+  timeout: 120000,
+});
 ```
 
 :::
@@ -550,10 +536,7 @@ On first run, your OS firewall may show a warning. Allow connections for:
 For MCP apps with token refresh issues:
 
 ```typescript
-import open from "open";
-
 const authProvider = browserAuth({
-  launch: open,
   store: fileStore(), // Use persistent storage
   authTimeout: 300000, // Increase timeout to 5 minutes
 });

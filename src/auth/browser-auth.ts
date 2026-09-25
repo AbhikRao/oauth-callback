@@ -33,11 +33,9 @@ import type {
  *
  * @example
  * ```typescript
- * import open from "open";
- *
  * const transport = new StreamableHTTPClientTransport(
  *   new URL("https://mcp.notion.com/mcp"),
- *   { authProvider: browserAuth({ launch: open }) }
+ *   { authProvider: browserAuth() }, // Opens the system browser
  * );
  * ```
  */
@@ -282,27 +280,17 @@ class BrowserOAuthProvider implements OAuthClientProvider {
   private async _completeAuthorizationFlow(
     authorizationUrl: URL,
   ): Promise<void> {
-    // Use managed mode (with launch) or headless mode based on _launch presence
-    const baseOptions = {
+    const result = await getAuthCode({
+      authorizationUrl: authorizationUrl.href,
+      launch: this._launch ?? true,
       port: this._port,
       hostname: this._hostname,
       callbackPath: this._callbackPath,
-      expectedState: authorizationUrl.searchParams.get("state") ?? undefined,
       timeout: this._authTimeout,
       successHtml: this._successHtml,
       errorHtml: this._errorHtml,
       onRequest: this._onRequest,
-    };
-
-    const result = await getAuthCode(
-      this._launch
-        ? {
-            ...baseOptions,
-            authorizationUrl: authorizationUrl.href,
-            launch: this._launch,
-          }
-        : baseOptions,
-    );
+    });
 
     // getAuthCode() throws OAuthError if result.error exists; this is a defensive
     // check for the edge case where neither code nor error is present.

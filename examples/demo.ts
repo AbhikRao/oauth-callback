@@ -290,6 +290,7 @@ async function runScenario(
       // No-browser mode: start server and manually trigger callback
       resultPromise = getAuthCode({
         authorizationUrl: authUrl.toString(),
+        launch: false,
         port: 3000,
         timeout: 10000,
         onRequest: (req) => {
