@@ -25,7 +25,7 @@ For web applications, this callback is typically a route on your server. But for
 
 Native applications (CLIs, desktop apps) can't expose public URLs for callbacks. Instead, they use the **loopback interface** — a temporary HTTP server on `http://localhost` or `http://127.0.0.1`. This pattern, standardized in [RFC 8252](https://www.rfc-editor.org/rfc/rfc8252.html) (OAuth 2.0 for Native Apps), provides several benefits:
 
-- **No public exposure**: The callback server only accepts local connections
+- **No public exposure**: The callback server listens on the loopback interface
 - **Dynamic ports**: Apps can use any available port (e.g., 3000, 8080)
 - **Automatic cleanup**: The server shuts down immediately after receiving the callback
 - **Universal support**: Works across all platforms without special permissions
@@ -212,23 +212,21 @@ OAuth Callback implements security best practices by default:
 
 ::: info Security Features
 
-- **Localhost-only binding** - The callback server only accepts connections from `127.0.0.1` or `::1`, preventing remote access attempts.
+- **Loopback by default** - The callback server binds to `localhost` by default. Keep `hostname` on a loopback interface (`127.0.0.1` or `::1`) so remote hosts can't reach it.
 - **Automatic cleanup** - The HTTP server shuts down immediately after receiving the callback, minimizing the attack surface window.
 - **No persistent state** - Server is ephemeral and leaves no traces after completion.
 
 :::
 
-::: warning Always Validate State
-Always validate the `state` parameter returned in the callback matches what you sent:
+::: warning Always Use State
+Always include a random `state` in the authorization URL. `getAuthCode` ignores
+callbacks that don't echo it:
 
-```typescript {4-7}
+```typescript {1-2}
 const state = crypto.randomUUID();
 const authUrl = `https://example.com/authorize?state=${state}&...`;
 
 const result = await getAuthCode(authUrl);
-if (result.state !== state) {
-  throw new Error("State mismatch - possible CSRF attack");
-}
 ```
 
 :::

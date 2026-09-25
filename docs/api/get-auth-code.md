@@ -24,41 +24,35 @@ The function accepts either:
 
 ### GetAuthCodeOptions
 
-| Property           | Type                       | Default       | Description                                   |
-| ------------------ | -------------------------- | ------------- | --------------------------------------------- |
-| `authorizationUrl` | `string`                   | _required_    | OAuth authorization URL with query parameters |
-| `port`             | `number`                   | `3000`        | Port for the local callback server            |
-| `hostname`         | `string`                   | `"localhost"` | Hostname to bind the server to                |
-| `callbackPath`     | `string`                   | `"/callback"` | URL path for OAuth callback                   |
-| `timeout`          | `number`                   | `30000`       | Timeout in milliseconds                       |
-| `launch`           | `(url: string) => unknown` | _none_        | Optional callback to launch auth URL          |
-| `successHtml`      | `string`                   | _built-in_    | Custom HTML for successful auth               |
-| `errorHtml`        | `string`                   | _built-in_    | Custom HTML template for errors               |
-| `signal`           | `AbortSignal`              | _none_        | For programmatic cancellation                 |
-| `onRequest`        | `(req: Request) => void`   | _none_        | Callback for request logging                  |
+| Property           | Type                                                 | Default       | Description                                                             |
+| ------------------ | ---------------------------------------------------- | ------------- | ----------------------------------------------------------------------- |
+| `authorizationUrl` | `string`                                             | _required_    | OAuth authorization URL with query parameters                           |
+| `port`             | `number`                                             | `3000`        | Port for the local callback server                                      |
+| `hostname`         | `string`                                             | `"localhost"` | Hostname to bind the server to                                          |
+| `callbackPath`     | `string`                                             | `"/callback"` | URL path for OAuth callback                                             |
+| `timeout`          | `number`                                             | `30000`       | Timeout in milliseconds                                                 |
+| `launch`           | `boolean \| ((authorizationUrl: string) => unknown)` | _required_    | `true`: system browser; `false`: you show the URL; or a custom launcher |
+| `successHtml`      | `string`                                             | _built-in_    | Custom HTML for successful auth                                         |
+| `errorHtml`        | `string`                                             | _built-in_    | Custom HTML template for errors                                         |
+| `signal`           | `AbortSignal`                                        | _none_        | For programmatic cancellation                                           |
+| `onRequest`        | `(req: Request) => void`                             | _none_        | Callback for request logging                                            |
 
 ## Return Value
 
-Returns a `Promise<CallbackResult>` containing:
-
-```typescript
-interface CallbackResult {
-  code: string; // Authorization code
-  state?: string; // State parameter (if provided)
-  [key: string]: any; // Additional query parameters
-}
-```
+Returns a `Promise<CallbackResult>` with the callback's query parameters.
+On successful resolution, `code` is always present; provider errors are thrown
+as `OAuthError` instead.
 
 ## Exceptions
 
 The function can throw:
 
-| Error Type   | Condition            | Description                                                     |
-| ------------ | -------------------- | --------------------------------------------------------------- |
-| `OAuthError` | OAuth provider error | Contains `error`, `error_description`, and optional `error_uri` |
-| `Error`      | Timeout              | "Timeout waiting for callback"                                  |
-| `Error`      | Port in use          | "EADDRINUSE" - port already occupied                            |
-| `Error`      | Cancellation         | "Operation aborted" via AbortSignal                             |
+| Error Type     | Condition            | Description                                                     |
+| -------------- | -------------------- | --------------------------------------------------------------- |
+| `OAuthError`   | OAuth provider error | Contains `error`, `error_description`, and optional `error_uri` |
+| `TimeoutError` | Timeout              | No valid callback within `timeout`                              |
+| `Error`        | Port in use          | "EADDRINUSE" - port already occupied                            |
+| `Error`        | Cancellation         | Flow cancelled via `AbortSignal`                                |
 
 ## Basic Usage
 
@@ -67,7 +61,6 @@ The function can throw:
 The recommended usage with automatic browser opening:
 
 ```typescript
-import open from "open";
 import { getAuthCode } from "oauth-callback";
 
 const authUrl =
@@ -79,7 +72,7 @@ const authUrl =
     state: "random_state",
   });
 
-const result = await getAuthCode({ authorizationUrl: authUrl, launch: open });
+const result = await getAuthCode({ authorizationUrl: authUrl, launch: true });
 console.log("Authorization code:", result.code);
 console.log("State:", result.state);
 ```
@@ -91,6 +84,7 @@ Using the options object for more control:
 ```typescript
 const result = await getAuthCode({
   authorizationUrl: authUrl,
+  launch: true,
   port: 8080,
   timeout: 60000,
   hostname: "127.0.0.1",
@@ -106,6 +100,7 @@ When port 3000 is unavailable or you've registered a different redirect URI:
 ```typescript
 const result = await getAuthCode({
   authorizationUrl: "https://oauth.example.com/authorize?...",
+  launch: true,
   port: 8888,
   callbackPath: "/oauth/callback", // Custom path
   hostname: "127.0.0.1", // Specific IP binding
@@ -126,6 +121,7 @@ Provide branded success and error pages:
 ```typescript
 const result = await getAuthCode({
   authorizationUrl: authUrl,
+  launch: true,
   successHtml: `
     <!DOCTYPE html>
     <html>
@@ -182,17 +178,10 @@ Monitor OAuth flow for debugging:
 ```typescript
 const result = await getAuthCode({
   authorizationUrl: authUrl,
+  launch: true,
   onRequest: (req) => {
     const url = new URL(req.url);
     console.log(`[${new Date().toISOString()}] ${req.method} ${url.pathname}`);
-
-    // Log specific paths
-    if (url.pathname === "/callback") {
-      console.log(
-        "Callback received with params:",
-        url.searchParams.toString(),
-      );
-    }
   },
 });
 ```
@@ -205,10 +194,11 @@ Configure timeout for different scenarios:
 try {
   const result = await getAuthCode({
     authorizationUrl: authUrl,
+    launch: true,
     timeout: 120000, // 2 minutes for first-time users
   });
 } catch (error) {
-  if (error.message === "Timeout waiting for callback") {
+  if (error instanceof TimeoutError) {
     console.error("Authorization took too long. Please try again.");
   }
 }
@@ -236,24 +226,26 @@ const timeoutId = setTimeout(() => {
 try {
   const result = await getAuthCode({
     authorizationUrl: authUrl,
+    launch: true,
     signal: controller.signal,
   });
 
   clearTimeout(timeoutId);
   console.log("Success! Code:", result.code);
 } catch (error) {
-  if (error.message === "Operation aborted") {
+  if (controller.signal.aborted) {
     console.log("Authorization was cancelled");
   }
 }
 ```
 
-### Headless / Manual Browser Control
+### Manual Browser Launch
 
-For environments where you want to handle browser opening yourself (SSH, CI, etc.):
+Pass `launch: false` to show the URL yourself. The browser must still run on
+the machine hosting the callback server, since the redirect targets `localhost`.
 
 ```typescript
-// Headless mode - print URL, let user open manually
+// Manual launch - print URL, let user open it
 const redirectUri = "http://localhost:3000/callback";
 const authUrl = `https://oauth.example.com/authorize?redirect_uri=${encodeURIComponent(redirectUri)}`;
 
@@ -261,17 +253,22 @@ console.log("Please open this URL in your browser:");
 console.log(authUrl);
 
 // Server waits for callback without opening browser
-const result = await getAuthCode({ port: 3000, timeout: 120000 });
+const result = await getAuthCode({
+  authorizationUrl: authUrl,
+  launch: false,
+  timeout: 120000,
+});
 ```
 
-Or use a custom launcher:
+Or use a custom launcher, e.g. to pick a specific browser:
 
 ```typescript
-import open from "open";
+import open, { apps } from "open";
 
 const result = await getAuthCode({
   authorizationUrl: authUrl,
-  launch: open, // Both authorizationUrl and launch are required together
+  launch: (authorizationUrl) =>
+    open(authorizationUrl, { app: { name: apps.firefox } }),
 });
 ```
 
@@ -282,11 +279,10 @@ const result = await getAuthCode({
 Handle all possible error scenarios:
 
 ```typescript
-import open from "open";
-import { getAuthCode, OAuthError } from "oauth-callback";
+import { getAuthCode, OAuthError, TimeoutError } from "oauth-callback";
 
 try {
-  const result = await getAuthCode({ authorizationUrl: authUrl, launch: open });
+  const result = await getAuthCode({ authorizationUrl: authUrl, launch: true });
   // Success - exchange code for token
   return result.code;
 } catch (error) {
@@ -320,10 +316,8 @@ try {
     }
   } else if (error.code === "EADDRINUSE") {
     console.error(`Port ${port} is already in use. Try a different port.`);
-  } else if (error.message === "Timeout waiting for callback") {
+  } else if (error instanceof TimeoutError) {
     console.error("Authorization timed out. Please try again.");
-  } else if (error.message === "Operation aborted") {
-    console.log("Authorization was cancelled by user");
   } else {
     // Unexpected errors
     console.error("Unexpected error:", error);
@@ -333,51 +327,16 @@ try {
 }
 ```
 
-### Retry Logic
-
-Implement retry for transient failures:
-
-```typescript
-async function getAuthCodeWithRetry(
-  authUrl: string,
-  maxAttempts = 3,
-): Promise<string> {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const result = await getAuthCode({
-        authorizationUrl: authUrl,
-        port: 3000 + attempt - 1, // Try different ports
-        timeout: 30000 * attempt, // Increase timeout each attempt
-      });
-      return result.code;
-    } catch (error) {
-      console.log(`Attempt ${attempt} failed:`, error.message);
-
-      if (attempt === maxAttempts) {
-        throw error;
-      }
-
-      // Don't retry user cancellations
-      if (error instanceof OAuthError && error.error === "access_denied") {
-        throw error;
-      }
-
-      console.log(`Retrying... (${attempt + 1}/${maxAttempts})`);
-    }
-  }
-}
-```
-
 ## Security Best Practices
 
 ### State Parameter Validation
 
-Always validate the state parameter to prevent CSRF attacks:
+Put a random `state` in the authorization URL. `getAuthCode` reads it from
+`authorizationUrl` and validates the callback before it can finish the flow:
 
 ```typescript
 import { randomBytes } from "crypto";
 
-// Generate secure random state
 const state = randomBytes(32).toString("base64url");
 
 const authUrl = new URL("https://oauth.example.com/authorize");
@@ -386,16 +345,19 @@ authUrl.searchParams.set("redirect_uri", "http://localhost:3000/callback");
 authUrl.searchParams.set("state", state);
 authUrl.searchParams.set("scope", "read write");
 
-const result = await getAuthCode(authUrl.toString());
+const result = await getAuthCode({
+  authorizationUrl: authUrl.toString(),
+  launch: true,
+});
 
-// Validate state matches
-if (result.state !== state) {
-  throw new Error("State mismatch - possible CSRF attack!");
-}
-
-// Safe to use authorization code
 console.log("Valid authorization code:", result.code);
 ```
+
+A callback must contain exactly one non-empty `code` or `error` (not both),
+at most one `state`, and, when the authorization URL has `state`, exactly that
+value. Other callbacks receive HTTP 400 and are ignored; the listener keeps
+waiting until the original timeout. An authorization URL with a duplicate or
+empty `state` throws a `TypeError` before the server starts.
 
 ### PKCE Implementation
 
@@ -454,6 +416,7 @@ async function authenticateWithGitHub() {
     console.log("Opening browser for GitHub authorization...");
     const result = await getAuthCode({
       authorizationUrl: authUrl.toString(),
+      launch: true,
       timeout: 60000,
       successHtml: "<h1>✅ GitHub authorization successful!</h1>",
     });
@@ -551,6 +514,7 @@ async function authenticate(provider: Provider): Promise<string> {
 
   const result = await getAuthCode({
     authorizationUrl: authUrl.toString(),
+    launch: true,
     timeout: 90000,
     onRequest: (req) => {
       console.log(`[${provider}] ${req.method} ${new URL(req.url).pathname}`);
@@ -580,7 +544,7 @@ describe("OAuth Flow", () => {
     const result = await getAuthCode({
       authorizationUrl: `http://localhost:${mockServer.port}/authorize`,
       port: 3001,
-      // No launch callback - tests simulate OAuth redirect
+      launch: fetch, // Follows the mock redirect to the callback
       timeout: 5000,
     });
 
@@ -599,7 +563,7 @@ describe("OAuth Flow", () => {
     await expect(
       getAuthCode({
         authorizationUrl: `http://localhost:${mockServer.port}/authorize`,
-        // No launch - test simulates OAuth redirect
+        launch: fetch, // Follows the mock redirect to the callback
       }),
     ).rejects.toThrow(OAuthError);
 
@@ -610,6 +574,33 @@ describe("OAuth Flow", () => {
 
 ## Migration Guide
 
+### From v2.x to v3.x
+
+The options object now requires both `authorizationUrl` and an explicit
+`launch` policy. The string form, `getAuthCode(url)`, is unchanged.
+
+```typescript
+// v2.x: server only, URL shown by the caller
+await getAuthCode({ port: 3000 });
+
+// v3.x: pass the URL so its `state` is validated
+await getAuthCode({ authorizationUrl: url, launch: false, port: 3000 });
+
+// v2.x and v3.x: custom launcher (unchanged)
+await getAuthCode({ authorizationUrl: url, launch: open });
+
+// v3.x: system browser without importing `open`
+await getAuthCode({ authorizationUrl: url, launch: true });
+```
+
+Other changes:
+
+- Callbacks with a mismatched `state`, or with an invalid `code`/`error`
+  shape, get HTTP 400 and no longer end the flow; the server keeps waiting.
+- An authorization URL with a duplicate or empty `state` throws `TypeError`.
+- `browserAuth()` without `launch` opens the system browser (v2.x waited
+  without showing the URL).
+
 ### From v1.x to v2.x
 
 ```typescript
@@ -619,6 +610,7 @@ const code = await captureAuthCode(url, 3000);
 // v2.x (new)
 const result = await getAuthCode({
   authorizationUrl: url,
+  launch: open,
   port: 3000,
 });
 const code = result.code;

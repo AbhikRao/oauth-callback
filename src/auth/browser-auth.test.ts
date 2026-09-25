@@ -264,79 +264,35 @@ describe("browserAuth concurrency", () => {
   });
 });
 
-describe("browserAuth state validation", () => {
-  test("rejects callback with mismatched state", async () => {
+describe("browserAuth authorization", () => {
+  test("uses system-browser launch when no launcher is configured", async () => {
+    let captured: { authorizationUrl?: string; launch?: unknown } | undefined;
+
     const { mock } = await import("bun:test");
     mock.module("../index", () => ({
-      getAuthCode: async () => ({
-        code: "test-code",
-        state: "wrong-state",
+      getAuthCode: async (options: typeof captured) => {
+        captured = options;
+        return { code: "test-code" };
+      },
+    }));
+    mock.module("@modelcontextprotocol/sdk/client/auth.js", () => ({
+      exchangeAuthorization: async () => ({
+        access_token: "test-token",
+        token_type: "Bearer",
       }),
+      discoverAuthorizationServerMetadata: async () => undefined,
     }));
 
     const { browserAuth: mockedBrowserAuth } = await import("./browser-auth");
     const provider = mockedBrowserAuth({ clientId: "test-client" });
+    await provider.saveCodeVerifier("test-verifier");
 
     const authUrl = new URL("https://example.com/auth?state=expected-state");
-
-    await expect(provider.redirectToAuthorization(authUrl)).rejects.toThrow(
-      "OAuth state mismatch",
-    );
-  });
-
-  test("accepts callback with matching state", async () => {
-    const { mock } = await import("bun:test");
-    mock.module("../index", () => ({
-      getAuthCode: async () => ({
-        code: "test-code",
-        state: "correct-state",
-      }),
-    }));
-    mock.module("@modelcontextprotocol/sdk/client/auth.js", () => ({
-      exchangeAuthorization: async () => ({
-        access_token: "test-token",
-        token_type: "Bearer",
-      }),
-      discoverAuthorizationServerMetadata: async () => undefined,
-    }));
-
-    const { browserAuth: mockedBrowserAuth } = await import("./browser-auth");
-    const provider = mockedBrowserAuth({ clientId: "test-client" });
-    await provider.saveCodeVerifier("test-verifier");
-
-    const authUrl = new URL("https://example.com/auth?state=correct-state");
-
-    // Should not throw
     await provider.redirectToAuthorization(authUrl);
-    expect(await provider.tokens()).toBeDefined();
-  });
 
-  test("skips state validation when no state in authorization URL", async () => {
-    const { mock } = await import("bun:test");
-    mock.module("../index", () => ({
-      getAuthCode: async () => ({
-        code: "test-code",
-        // No state in callback (legacy flow)
-      }),
-    }));
-    mock.module("@modelcontextprotocol/sdk/client/auth.js", () => ({
-      exchangeAuthorization: async () => ({
-        access_token: "test-token",
-        token_type: "Bearer",
-      }),
-      discoverAuthorizationServerMetadata: async () => undefined,
-    }));
-
-    const { browserAuth: mockedBrowserAuth } = await import("./browser-auth");
-    const provider = mockedBrowserAuth({ clientId: "test-client" });
-    await provider.saveCodeVerifier("test-verifier");
-
-    // No state in auth URL
-    const authUrl = new URL("https://example.com/auth");
-
-    // Should not throw
-    await provider.redirectToAuthorization(authUrl);
-    expect(await provider.tokens()).toBeDefined();
+    // getAuthCode derives and validates state from this URL.
+    expect(captured?.authorizationUrl).toBe(authUrl.href);
+    expect(captured?.launch).toBe(true);
   });
 
   test("uses authServerUrl when token endpoint differs from authorization origin", async () => {

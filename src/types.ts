@@ -4,7 +4,33 @@
 /**
  * Configuration options for OAuth authorization code flow
  */
-interface GetAuthCodeOptionsBase {
+export interface GetAuthCodeOptions {
+  /**
+   * OAuth authorization URL that the user will be redirected to.
+   * Should include all necessary query parameters like client_id, redirect_uri, etc.
+   * If it contains `state`, callbacks must echo exactly that value (ADR-004).
+   */
+  authorizationUrl: string;
+
+  /**
+   * How the authorization URL is opened:
+   * - `true`: the system browser (via the bundled `open` package)
+   * - `false`: not at all; the caller shows the URL to the user
+   * - function: a custom launcher
+   *
+   * Required so adding other options can't silently change launch behavior.
+   * Called once the callback listener is ready, best-effort (errors are swallowed).
+   *
+   * Returns `unknown` (not `void`) to accept any launcher without casting—e.g.,
+   * the `open` package returns `Promise<ChildProcess>`. Return value is ignored.
+   *
+   * @example
+   * ```typescript
+   * await getAuthCode({ authorizationUrl: url, launch: true, timeout: 60000 });
+   * ```
+   */
+  launch: boolean | ((authorizationUrl: string) => unknown);
+
   /**
    * Port for the local callback server. Make sure this matches the
    * redirect_uri registered with your OAuth provider.
@@ -60,42 +86,3 @@ interface GetAuthCodeOptionsBase {
    */
   onRequest?: (req: Request) => void;
 }
-
-/**
- * Headless mode: caller handles URL display, library just runs callback server.
- * Use when you want to print the URL yourself or in CI/SSH environments.
- */
-type GetAuthCodeOptionsHeadless = GetAuthCodeOptionsBase & {
-  authorizationUrl?: never;
-  launch?: never;
-};
-
-/**
- * Managed mode: library launches the authorization URL automatically.
- * Both authorizationUrl and launch are required together.
- */
-type GetAuthCodeOptionsManaged = GetAuthCodeOptionsBase & {
-  /**
-   * OAuth authorization URL that the user will be redirected to.
-   * Should include all necessary query parameters like client_id, redirect_uri, etc.
-   */
-  authorizationUrl: string;
-
-  /**
-   * Callback to launch the authorization URL.
-   * Called after the callback server starts, best-effort (errors are swallowed).
-   *
-   * Returns `unknown` (not `void`) to accept any launcher without casting—e.g.,
-   * the `open` package returns `Promise<ChildProcess>`. Return value is ignored.
-   *
-   * @example
-   * ```typescript
-   * import open from "open";
-   * await getAuthCode({ authorizationUrl: url, launch: open });
-   * ```
-   */
-  launch: (url: string) => unknown;
-};
-
-export type GetAuthCodeOptions =
-  GetAuthCodeOptionsHeadless | GetAuthCodeOptionsManaged;

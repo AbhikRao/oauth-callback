@@ -48,16 +48,14 @@ But CLI tools and desktop apps don't have public URLs. They run on the user's ma
 
 OAuth Callback creates a temporary HTTP server on localhost that:
 
-1. **Binds locally**: Only accepts connections from `127.0.0.1`
+1. **Binds locally**: Listens on `localhost` by default (keep `hostname` on a loopback interface)
 2. **Uses dynamic ports**: Works with any available port
 3. **Auto-terminates**: Shuts down after receiving the callback
 4. **Handles edge cases**: Timeouts, errors, user cancellation
 
 ```typescript
-import open from "open";
-
 // This single function handles all the complexity
-const result = await getAuthCode({ authorizationUrl, launch: open });
+const result = await getAuthCode({ authorizationUrl, launch: true });
 ```
 
 ## Architecture Overview
@@ -121,7 +119,7 @@ interface GetAuthCodeOptions {
   authorizationUrl: string; // OAuth provider URL
   port?: number; // Server port (default: 3000)
   timeout?: number; // Timeout in ms (default: 30000)
-  launch?: (url: string) => unknown; // Optional URL launcher
+  launch: boolean | ((authorizationUrl: string) => unknown); // true: system browser, false: caller shows URL
   signal?: AbortSignal; // For cancellation
   // ... more options
 }
@@ -307,22 +305,12 @@ Security is built into every layer of OAuth Callback:
 
 ### Network Security
 
-```typescript
-// Localhost-only binding
-server.listen(port, "127.0.0.1");
-
-// IPv6 localhost support
-server.listen(port, "::1");
-
-// Reject non-localhost connections
-if (!isLocalhost(request.socket.remoteAddress)) {
-  return reject();
-}
-```
+The callback server binds to `localhost` by default. Keep `hostname` on a
+loopback interface (`127.0.0.1` or `::1`) so remote hosts can't reach it.
 
 ### OAuth Security
 
-- **State parameter**: Prevents CSRF attacks
+- **State parameter**: Callbacks must echo the authorization URL's `state` (ADR-004)
 - **PKCE support**: Protects authorization codes
 - **Timeout enforcement**: Limits exposure window
 - **Automatic cleanup**: Reduces attack surface
@@ -403,7 +391,7 @@ OAuth Callback is designed for optimal performance:
 
 ### Fast Startup
 
-- Minimal dependencies (only `open` package)
+- No external runtime dependencies; browser launcher loaded lazily
 - Lazy loading of heavy modules
 - Pre-compiled HTML templates
 
@@ -417,7 +405,7 @@ OAuth Callback is designed for optimal performance:
 
 - Immediate browser redirect handling
 - Non-blocking I/O operations
-- Parallel browser launch and server start
+- Callback listener ready before browser launch
 
 ## Extension Points
 
@@ -441,14 +429,14 @@ class RedisStore implements TokenStore {
 }
 ```
 
-### Request Interception
+### Request Observation
 
-Monitor or modify requests with callbacks:
+Monitor requests with a callback:
 
 ```typescript
 {
   onRequest: (req) => {
-    console.log(`OAuth: ${req.method} ${req.url}`);
+    console.log(`OAuth: ${req.method} ${new URL(req.url).pathname}`);
     // Add telemetry, logging, etc.
   };
 }
@@ -459,14 +447,15 @@ Monitor or modify requests with callbacks:
 Customize how the authorization URL is opened:
 
 ```typescript
-import open from "open";
-
 // Use system browser
-await getAuthCode({ authorizationUrl, launch: open });
+await getAuthCode({ authorizationUrl, launch: true });
 
-// Headless mode - omit launch, print URL manually
+// Custom launcher
+await getAuthCode({ authorizationUrl, launch: (url) => myLauncher(url) });
+
+// Manual launch - print URL for the user to open
 console.log(`Open: ${authorizationUrl}`);
-await getAuthCode({ authorizationUrl });
+await getAuthCode({ authorizationUrl, launch: false });
 ```
 
 ## Best Practices
@@ -489,13 +478,13 @@ try {
 
 ### State Validation
 
-Always validate the state parameter:
+Include a random `state` in the authorization URL; `getAuthCode()` rejects
+callbacks that don't echo it:
 
 ```typescript
 const state = crypto.randomUUID();
-// Include in auth URL
+const authUrl = `https://example.com/authorize?state=${state}&...`;
 const result = await getAuthCode(authUrl);
-if (result.state !== state) throw new Error("CSRF detected");
 ```
 
 ### Token Storage

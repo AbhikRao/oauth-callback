@@ -39,14 +39,12 @@ OAuth Callback supports multiple import patterns to suit different use cases:
 ### Main Package Import
 
 ```typescript
-import open from "open";
-
 // Core functionality
 import { getAuthCode, OAuthError } from "oauth-callback";
 
 // Namespace import for MCP features
 import { mcp } from "oauth-callback";
-const authProvider = mcp.browserAuth({ launch: open, store: mcp.fileStore() });
+const authProvider = mcp.browserAuth({ store: mcp.fileStore() });
 ```
 
 ### MCP-Specific Import
@@ -132,7 +130,6 @@ Ephemeral storage that keeps tokens in memory:
 
 ```typescript
 const authProvider = browserAuth({
-  launch: open,
   store: inMemoryStore(), // Tokens lost on restart
 });
 ```
@@ -143,7 +140,6 @@ Persistent storage that saves tokens to a JSON file:
 
 ```typescript
 const authProvider = browserAuth({
-  launch: open,
   store: fileStore(), // Default: ~/.mcp/tokens.json
 });
 ```
@@ -184,17 +180,21 @@ interface GetAuthCodeOptions {
   hostname?: string;
   callbackPath?: string;
   timeout?: number;
-  launch?: (url: string) => unknown;
+  launch: boolean | ((authorizationUrl: string) => unknown);
   successHtml?: string;
   errorHtml?: string;
   signal?: AbortSignal;
   onRequest?: (req: Request) => void;
 }
 
+// Callback query parameters; `code` is always present when getAuthCode resolves
 interface CallbackResult {
-  code: string;
+  code?: string;
   state?: string;
-  [key: string]: any;
+  error?: string;
+  error_description?: string;
+  error_uri?: string;
+  [key: string]: string | undefined;
 }
 ```
 
@@ -234,12 +234,10 @@ console.log("Code:", result.code);
 ### MCP Integration
 
 ```typescript
-import open from "open";
 import { browserAuth, fileStore } from "oauth-callback/mcp";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 
 const authProvider = browserAuth({
-  launch: open,
   store: fileStore(),
   scope: "read write",
 });
@@ -281,7 +279,6 @@ class RedisStore implements TokenStore {
 }
 
 const authProvider = browserAuth({
-  launch: open,
   store: new RedisStore(),
 });
 ```
@@ -292,24 +289,20 @@ const authProvider = browserAuth({
 
 - **PKCE by default** - Proof Key for Code Exchange enabled
 - **State validation** - Automatic CSRF protection
-- **Localhost-only binding** - Server only accepts local connections
+- **Loopback by default** - Binds to `localhost` unless you set `hostname`
 - **Automatic cleanup** - Server shuts down after callback
 - **Secure file permissions** - Mode 0600 for file storage
 
 ### Best Practices
 
 ```typescript
-// Always validate state for CSRF protection
+// Always include state; getAuthCode validates the callback against it
 const state = crypto.randomUUID();
 const authUrl = `https://example.com/authorize?state=${state}&...`;
 const result = await getAuthCode(authUrl);
-if (result.state !== state) {
-  throw new Error("State mismatch - possible CSRF attack");
-}
 
 // Use ephemeral storage for maximum security
 const authProvider = browserAuth({
-  launch: open,
   store: inMemoryStore(), // No disk persistence
 });
 
@@ -358,7 +351,6 @@ Automatically register OAuth clients without pre-configuration:
 ```typescript
 // No client_id or client_secret needed!
 const authProvider = browserAuth({
-  launch: open,
   scope: "read write",
   store: fileStore(),
 });
@@ -369,13 +361,12 @@ const authProvider = browserAuth({
 ```typescript
 function createAuthProvider(env: "dev" | "staging" | "prod") {
   const configs = {
-    dev: { launch: open, port: 3000, store: inMemoryStore() },
+    dev: { port: 3000, store: inMemoryStore() },
     staging: {
-      launch: open,
       port: 3001,
       store: fileStore("~/.mcp/staging.json"),
     },
-    prod: { launch: open, port: 3002, store: fileStore("~/.mcp/prod.json") },
+    prod: { port: 3002, store: fileStore("~/.mcp/prod.json") },
   };
   return browserAuth(configs[env]);
 }
@@ -385,7 +376,6 @@ function createAuthProvider(env: "dev" | "staging" | "prod") {
 
 ```typescript
 const authProvider = browserAuth({
-  launch: open,
   onRequest: (req) => {
     const url = new URL(req.url);
     console.log(`[OAuth] ${req.method} ${url.pathname}`);
@@ -416,22 +406,22 @@ class CustomOAuthProvider {
 }
 
 // After: Using browserAuth
-const authProvider = browserAuth({ launch: open, store: fileStore() });
+const authProvider = browserAuth({ store: fileStore() });
 ```
 
 ## API Stability
 
-| API              | Status | Since  | Notes                         |
-| ---------------- | ------ | ------ | ----------------------------- |
-| `getAuthCode`    | Stable | v1.0.0 | Core API, backward compatible |
-| `getRedirectUrl` | Stable | v1.0.0 | Redirect URI helper           |
-| `OAuthError`     | Stable | v1.0.0 | OAuth-specific errors         |
-| `TimeoutError`   | Stable | v1.0.0 | Timeout error class           |
-| `mcp`            | Stable | v2.0.0 | MCP namespace export          |
-| `browserAuth`    | Stable | v2.0.0 | MCP integration               |
-| `inMemoryStore`  | Stable | v2.0.0 | Storage provider              |
-| `fileStore`      | Stable | v2.0.0 | Storage provider              |
-| Types            | Stable | v1.0.0 | TypeScript definitions        |
+| API              | Status | Since  | Notes                  |
+| ---------------- | ------ | ------ | ---------------------- |
+| `getAuthCode`    | Stable | v1.0.0 | Core API               |
+| `getRedirectUrl` | Stable | v1.0.0 | Redirect URI helper    |
+| `OAuthError`     | Stable | v1.0.0 | OAuth-specific errors  |
+| `TimeoutError`   | Stable | v1.0.0 | Timeout error class    |
+| `mcp`            | Stable | v2.0.0 | MCP namespace export   |
+| `browserAuth`    | Stable | v2.0.0 | MCP integration        |
+| `inMemoryStore`  | Stable | v2.0.0 | Storage provider       |
+| `fileStore`      | Stable | v2.0.0 | Storage provider       |
+| Types            | Stable | v1.0.0 | TypeScript definitions |
 
 ## Related Resources
 

@@ -81,9 +81,9 @@ export interface BrowserAuthOptions {
   store?: TokenStore; // Default: in-memory (lost on restart). Use OAuthStore for persistence.
   storeKey?: string; // Storage key for token isolation. Default: "mcp-tokens"
 
-  /** Callback to launch the authorization URL. Omit for headless mode.
+  /** Custom launcher for the authorization URL. Default: the system browser.
    * Returns `unknown` to accept any launcher (e.g., `open` → `Promise<ChildProcess>`). */
-  launch?: (url: string) => unknown;
+  launch?: (authorizationUrl: string) => unknown;
 
   authTimeout?: number; // Max wait for user authorization. Default: 300000ms (5 min)
 

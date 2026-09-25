@@ -53,7 +53,11 @@ export interface CallbackServer {
   /** Start the HTTP server with the given options */
   start(options: ServerOptions): Promise<void>;
   /** Wait for OAuth callback on the specified path with timeout */
-  waitForCallback(path: string, timeout: number): Promise<CallbackResult>;
+  waitForCallback(
+    path: string,
+    timeout: number,
+    expectedState?: string,
+  ): Promise<CallbackResult>;
   /** Stop the server and cleanup resources */
   stop(): Promise<void>;
 }
@@ -101,6 +105,33 @@ function escapeHtml(value = ""): string {
 }
 
 /**
+ * Parses a callback only when its security-sensitive parameters are unambiguous.
+ * Invalid callbacks are ignored so a stale tab or local request cannot end the flow.
+ */
+function parseCallback(
+  url: URL,
+  expectedState?: string,
+): CallbackResult | undefined {
+  const codes = url.searchParams.getAll("code");
+  const errors = url.searchParams.getAll("error");
+  const validCode =
+    codes.length === 1 && codes[0] !== "" && errors.length === 0;
+  const validError =
+    errors.length === 1 && errors[0] !== "" && codes.length === 0;
+
+  if (!validCode && !validError) return undefined;
+
+  const states = url.searchParams.getAll("state");
+  if (states.length > 1) return undefined;
+  if (expectedState !== undefined && states[0] !== expectedState)
+    return undefined;
+
+  const params: CallbackResult = {};
+  for (const [key, value] of url.searchParams) params[key] = value;
+  return params;
+}
+
+/**
  * Base class with shared logic for all runtime implementations.
  */
 abstract class BaseCallbackServer implements CallbackServer {
@@ -111,6 +142,7 @@ abstract class BaseCallbackServer implements CallbackServer {
     {
       resolve: (result: CallbackResult) => void;
       reject: (error: Error) => void;
+      expectedState?: string;
     }
   >();
   protected successHtml?: string;
@@ -154,10 +186,18 @@ abstract class BaseCallbackServer implements CallbackServer {
 
     if (!listener) return new Response("Not Found", { status: 404 });
 
-    const params: CallbackResult = {};
-    for (const [key, value] of url.searchParams) params[key] = value;
+    const params = parseCallback(url, listener.expectedState);
+    // Plain text, not the error page: the real authorization may still succeed in another tab.
+    if (!params)
+      return new Response(
+        "This callback does not match the active authorization request. You can close this tab.",
+        {
+          status: 400,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        },
+      );
 
-    // Resolve the promise for the waiting listener.
+    // Resolve only after the callback shape and optional state have been validated.
     listener.resolve(params);
     this.callbackReceived = true;
 
@@ -176,6 +216,7 @@ abstract class BaseCallbackServer implements CallbackServer {
   public async waitForCallback(
     path: string,
     timeout: number,
+    expectedState?: string,
   ): Promise<CallbackResult> {
     if (!path) throw new Error("Callback path is required");
     const normalizedPath = path.startsWith("/") ? path : `/${path}`;
@@ -192,7 +233,11 @@ abstract class BaseCallbackServer implements CallbackServer {
     try {
       return await Promise.race([
         new Promise<CallbackResult>((resolve, reject) => {
-          this.callbackListeners.set(normalizedPath, { resolve, reject });
+          this.callbackListeners.set(normalizedPath, {
+            resolve,
+            reject,
+            expectedState,
+          });
         }),
         new Promise<CallbackResult>((_, reject) => {
           timeoutId = setTimeout(() => {

@@ -392,7 +392,7 @@ async function connectWithErrorHandling() {
     store: fileStore(),
     onRequest: (req) => {
       // Log OAuth flow for debugging
-      console.log(`OAuth: ${req.url}`);
+      console.log(`OAuth: ${new URL(req.url).pathname}`);
     },
   });
 
@@ -470,7 +470,7 @@ flowchart TD
 catch (error) {
   if (error instanceof OAuthError) {
     // Handle OAuth-specific errors
-  } else if (error.message === "Timeout waiting for callback") {
+  } else if (error instanceof TimeoutError) {
     // Handle timeout
   } else {
     // Handle unexpected errors

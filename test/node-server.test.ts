@@ -14,39 +14,48 @@ const KILL_AFTER_MS = 15_000;
 let tempDir: string;
 
 // Opens a browser-style preconnect socket that never sends a request (#35),
-// then either completes the callback or lets it time out.
+// then either completes the callback or lets it time out. The "abort" scenario
+// instead aborts while the server is still starting.
 const runner = `
 import net from "node:net";
 import { getAuthCode } from "./index.js";
 
 const [scenario, port] = [process.argv[2], Number(process.argv[3])];
+const controller = new AbortController();
 const auth = getAuthCode({
   authorizationUrl: "http://localhost/authorize",
   port,
-  openBrowser: false,
+  launch: false,
   timeout: scenario === "timeout" ? 300 : 5000,
+  signal: controller.signal,
 });
-// Retry until the server listens, so the idle socket is really open.
-async function preconnect() {
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const socket = net.connect(port, "localhost");
-    const connected = await new Promise((resolve) =>
-      socket.once("connect", () => resolve(true)).once("error", () => resolve(false)),
-    );
-    if (connected) return socket;
-    await new Promise((resolve) => setTimeout(resolve, 20));
+if (scenario === "abort") {
+  controller.abort();
+  const result = await auth.then((r) => r.code, (e) => e.message);
+  console.log(JSON.stringify({ result, html: "" }));
+} else {
+  // Retry until the server listens, so the idle socket is really open.
+  async function preconnect() {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const socket = net.connect(port, "localhost");
+      const connected = await new Promise((resolve) =>
+        socket.once("connect", () => resolve(true)).once("error", () => resolve(false)),
+      );
+      if (connected) return socket;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("Server did not start listening");
   }
-  throw new Error("Server did not start listening");
-}
-const idle = await preconnect();
+  const idle = await preconnect();
 
-let html = "";
-if (scenario === "callback") {
-  html = await (await fetch(\`http://localhost:\${port}/callback?code=abc\`)).text();
+  let html = "";
+  if (scenario === "callback") {
+    html = await (await fetch(\`http://localhost:\${port}/callback?code=abc\`)).text();
+  }
+  const result = await auth.then((r) => r.code, (e) => e.name);
+  idle.destroy();
+  console.log(JSON.stringify({ result, html }));
 }
-const result = await auth.then((r) => r.code, (e) => e.name);
-idle.destroy();
-console.log(JSON.stringify({ result, html }));
 `;
 
 async function run(scenario: string, port: number) {
@@ -103,6 +112,17 @@ describe.skipIf(!node)("NodeCallbackServer", () => {
       const { result } = await run("timeout", 43_902);
 
       expect(result).toBe("TimeoutError");
+    },
+    KILL_AFTER_MS + 5_000,
+  );
+
+  test(
+    "rejects promptly and exits when aborted during start",
+    async () => {
+      // A lost abort would surface as the 5s timeout message instead.
+      const { result } = await run("abort", 43_903);
+
+      expect(result).toBe("Operation aborted");
     },
     KILL_AFTER_MS + 5_000,
   );

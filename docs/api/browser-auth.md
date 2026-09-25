@@ -17,22 +17,22 @@ function browserAuth(options?: BrowserAuthOptions): OAuthClientProvider;
 
 ### BrowserAuthOptions
 
-| Property        | Type                       | Default           | Description                                                                                                                                   |
-| --------------- | -------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `clientId`      | `string`                   | _none_            | Pre-registered OAuth client ID                                                                                                                |
-| `clientSecret`  | `string`                   | _none_            | Pre-registered OAuth client secret                                                                                                            |
-| `scope`         | `string`                   | _none_            | OAuth scopes to request. When omitted, the auth server uses its default scope.                                                                |
-| `port`          | `number`                   | `3000`            | Port for local callback server                                                                                                                |
-| `hostname`      | `string`                   | `"localhost"`     | Hostname to bind server to                                                                                                                    |
-| `callbackPath`  | `string`                   | `"/callback"`     | URL path for OAuth callback                                                                                                                   |
-| `store`         | `TokenStore`               | `inMemoryStore()` | Token storage implementation                                                                                                                  |
-| `storeKey`      | `string`                   | `"mcp-tokens"`    | Storage key for token isolation                                                                                                               |
-| `launch`        | `(url: string) => unknown` | _none_            | Callback to launch auth URL                                                                                                                   |
-| `authTimeout`   | `number`                   | `300000`          | Auth timeout in ms (5 min)                                                                                                                    |
-| `successHtml`   | `string`                   | _built-in_        | Custom success page HTML                                                                                                                      |
-| `errorHtml`     | `string`                   | _built-in_        | Custom error page HTML                                                                                                                        |
-| `onRequest`     | `(req: Request) => void`   | _none_            | Request logging callback                                                                                                                      |
-| `authServerUrl` | `string \| URL`            | _auto_            | Base URL for OAuth metadata discovery. Defaults to the authorization URL's origin. Set this when the token endpoint is on a different origin. |
+| Property        | Type                                    | Default           | Description                                                                                                                                   |
+| --------------- | --------------------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `clientId`      | `string`                                | _none_            | Pre-registered OAuth client ID                                                                                                                |
+| `clientSecret`  | `string`                                | _none_            | Pre-registered OAuth client secret                                                                                                            |
+| `scope`         | `string`                                | _none_            | OAuth scopes to request. When omitted, the auth server uses its default scope.                                                                |
+| `port`          | `number`                                | `3000`            | Port for local callback server                                                                                                                |
+| `hostname`      | `string`                                | `"localhost"`     | Hostname to bind server to                                                                                                                    |
+| `callbackPath`  | `string`                                | `"/callback"`     | URL path for OAuth callback                                                                                                                   |
+| `store`         | `TokenStore`                            | `inMemoryStore()` | Token storage implementation                                                                                                                  |
+| `storeKey`      | `string`                                | `"mcp-tokens"`    | Storage key for token isolation                                                                                                               |
+| `launch`        | `(authorizationUrl: string) => unknown` | _system browser_  | Custom launcher for the auth URL                                                                                                              |
+| `authTimeout`   | `number`                                | `300000`          | Auth timeout in ms (5 min)                                                                                                                    |
+| `successHtml`   | `string`                                | _built-in_        | Custom success page HTML                                                                                                                      |
+| `errorHtml`     | `string`                                | _built-in_        | Custom error page HTML                                                                                                                        |
+| `onRequest`     | `(req: Request) => void`                | _none_            | Request logging callback                                                                                                                      |
+| `authServerUrl` | `string \| URL`                         | _auto_            | Base URL for OAuth metadata discovery. Defaults to the authorization URL's origin. Set this when the token endpoint is on a different origin. |
 
 ## Return Value
 
@@ -70,13 +70,12 @@ interface OAuthClientProvider {
 The simplest usage with default settings:
 
 ```typescript
-import open from "open";
 import { browserAuth } from "oauth-callback/mcp";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-// Create OAuth provider - pass open to launch browser
-const authProvider = browserAuth({ launch: open });
+// Create OAuth provider - opens the system browser
+const authProvider = browserAuth();
 
 // Use with MCP transport
 const transport = new StreamableHTTPClientTransport(
@@ -97,11 +96,9 @@ await client.connect(transport);
 Store tokens across sessions:
 
 ```typescript
-import open from "open";
 import { browserAuth, fileStore } from "oauth-callback/mcp";
 
 const authProvider = browserAuth({
-  launch: open,
   store: fileStore(), // Persists to ~/.mcp/tokens.json
   scope: "read write",
 });
@@ -114,13 +111,10 @@ const authProvider = browserAuth({
 If you have pre-registered OAuth credentials:
 
 ```typescript
-import open from "open";
-
 const authProvider = browserAuth({
   clientId: process.env.OAUTH_CLIENT_ID,
   clientSecret: process.env.OAUTH_CLIENT_SECRET,
   scope: "read write admin",
-  launch: open,
   store: fileStore(),
 });
 ```
@@ -130,11 +124,9 @@ const authProvider = browserAuth({
 Store tokens in a specific location:
 
 ```typescript
-import open from "open";
 import { browserAuth, fileStore } from "oauth-callback/mcp";
 
 const authProvider = browserAuth({
-  launch: open,
   store: fileStore("/path/to/my-tokens.json"),
   storeKey: "my-app-production", // Namespace for multiple environments
 });
@@ -145,13 +137,10 @@ const authProvider = browserAuth({
 Configure the callback server:
 
 ```typescript
-import open from "open";
-
 const authProvider = browserAuth({
   port: 8080,
   hostname: "127.0.0.1",
   callbackPath: "/oauth/callback",
-  launch: open,
   store: fileStore(),
 });
 ```
@@ -168,10 +157,7 @@ Ensure your OAuth app's redirect URI matches your configuration:
 Provide branded callback pages:
 
 ```typescript
-import open from "open";
-
 const authProvider = browserAuth({
-  launch: open,
   successHtml: `
     <!DOCTYPE html>
     <html>
@@ -222,31 +208,12 @@ const authProvider = browserAuth({
 Monitor OAuth flow for debugging:
 
 ```typescript
-import open from "open";
-
 const authProvider = browserAuth({
-  launch: open,
   onRequest: (req) => {
     const url = new URL(req.url);
     console.log(`[OAuth] ${req.method} ${url.pathname}`);
-
-    if (url.pathname === "/callback") {
-      console.log("[OAuth] Callback params:", url.searchParams.toString());
-    }
   },
   store: fileStore(),
-});
-```
-
-### Headless/CI Environment
-
-Disable browser opening for automated environments:
-
-```typescript
-const authProvider = browserAuth({
-  launch: () => {}, // Noop - no browser opening
-  authTimeout: 10000, // Shorter timeout for CI
-  store: inMemoryStore(),
 });
 ```
 
@@ -280,12 +247,9 @@ sequenceDiagram
 No pre-registration needed:
 
 ```typescript
-import open from "open";
-
 // No clientId or clientSecret required!
 const authProvider = browserAuth({
   scope: "read write",
-  launch: open,
   store: fileStore(), // Persist dynamically registered client
 });
 
@@ -338,11 +302,9 @@ interface OAuthStore extends TokenStore {
 Ephemeral storage (tokens lost on restart):
 
 ```typescript
-import open from "open";
 import { browserAuth, inMemoryStore } from "oauth-callback/mcp";
 
 const authProvider = browserAuth({
-  launch: open,
   store: inMemoryStore(),
 });
 ```
@@ -358,18 +320,15 @@ const authProvider = browserAuth({
 Persistent storage to JSON file:
 
 ```typescript
-import open from "open";
 import { browserAuth, fileStore } from "oauth-callback/mcp";
 
 // Default location: ~/.mcp/tokens.json
 const authProvider = browserAuth({
-  launch: open,
   store: fileStore(),
 });
 
 // Custom location
 const customAuth = browserAuth({
-  launch: open,
   store: fileStore("/path/to/tokens.json"),
 });
 ```
@@ -406,7 +365,6 @@ class RedisStore implements TokenStore {
 
 // Use custom store
 const authProvider = browserAuth({
-  launch: open,
   store: new RedisStore(redisClient),
 });
 ```
@@ -445,11 +403,8 @@ Tokens are tracked with expiry times. The provider returns `undefined` from `tok
 File storage uses restrictive permissions:
 
 ```typescript
-import open from "open";
-
 // Files are created with mode 0600 (owner read/write only)
 const authProvider = browserAuth({
-  launch: open,
   store: fileStore(), // Secure file permissions
 });
 ```
@@ -479,10 +434,7 @@ try {
 Configure timeout for different scenarios:
 
 ```typescript
-import open from "open";
-
 const authProvider = browserAuth({
-  launch: open,
   authTimeout: 600000, // 10 minutes for first-time setup
 });
 ```
@@ -494,7 +446,6 @@ const authProvider = browserAuth({
 Full example with Dynamic Client Registration:
 
 ```typescript
-import open from "open";
 import { browserAuth, fileStore } from "oauth-callback/mcp";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -502,7 +453,6 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 async function connectToNotion() {
   // No client credentials needed - uses DCR!
   const authProvider = browserAuth({
-    launch: open, // Opens browser for OAuth consent
     store: fileStore(), // Persist tokens and client registration
     scope: "read write",
     onRequest: (req) => {
@@ -548,28 +498,25 @@ connectToNotion();
 Support development, staging, and production:
 
 ```typescript
-import open from "open";
 import { browserAuth, fileStore, inMemoryStore } from "oauth-callback/mcp";
 
 function createAuthProvider(environment: "dev" | "staging" | "prod") {
   const configs = {
     dev: {
       port: 3000,
-      launch: open,
       store: inMemoryStore(), // No persistence in dev
       authTimeout: 60000,
-      onRequest: (req: Request) => console.log("[DEV]", req.url),
+      onRequest: (req: Request) =>
+        console.log("[DEV]", new URL(req.url).pathname),
     },
     staging: {
       port: 3001,
-      launch: open,
       store: fileStore("~/.mcp/staging-tokens.json"),
       storeKey: "staging",
       authTimeout: 120000,
     },
     prod: {
       port: 3002,
-      launch: open,
       store: fileStore("~/.mcp/prod-tokens.json"),
       storeKey: "production",
       authTimeout: 300000,
@@ -665,7 +612,7 @@ describe("OAuth Flow Integration", () => {
   it("should complete full OAuth flow", async () => {
     const authProvider = browserAuth({
       port: 3001,
-      launch: () => {}, // Noop - don't open browser in tests
+      launch: fetch, // Follows the mock redirect to the callback
       store: inMemoryStore(),
     });
 
@@ -687,11 +634,8 @@ describe("OAuth Flow Integration", () => {
 ::: details Port Already in Use
 
 ```typescript
-import open from "open";
-
 // Use a different port
 const authProvider = browserAuth({
-  launch: open,
   port: 8080, // Try alternative port
 });
 ```
@@ -701,11 +645,8 @@ const authProvider = browserAuth({
 ::: details Tokens Not Persisting
 
 ```typescript
-import open from "open";
-
 // Ensure you're using file store, not in-memory
 const authProvider = browserAuth({
-  launch: open,
   store: fileStore(), // ✅ Persistent
   // store: inMemoryStore() // ❌ Lost on restart
 });
@@ -717,11 +658,8 @@ const authProvider = browserAuth({
 Some servers may not support Dynamic Client Registration:
 
 ```typescript
-import open from "open";
-
 // Fallback to pre-registered credentials
 const authProvider = browserAuth({
-  launch: open,
   clientId: "your-client-id",
   clientSecret: "your-client-secret",
 });
@@ -732,11 +670,9 @@ const authProvider = browserAuth({
 ::: details Browser Not Opening
 
 ```typescript
-import open from "open";
-
-// Conditionally open browser based on environment
+// Print the URL so the user can open it manually
 const authProvider = browserAuth({
-  launch: process.env.CI ? () => {} : open,
+  launch: (authorizationUrl) => console.log(`Open: ${authorizationUrl}`),
 });
 ```
 
@@ -771,7 +707,6 @@ const tokens = await exchangeCodeForTokens(code);
 
 // After: Using browserAuth
 const authProvider = browserAuth({
-  launch: open,
   store: fileStore(),
 });
 // Automatic handling of entire OAuth flow!
@@ -781,11 +716,10 @@ const authProvider = browserAuth({
 
 ```typescript
 // Before: Tokens lost on restart
-const authProvider = browserAuth({ launch: open });
+const authProvider = browserAuth();
 
 // After: Tokens persist across sessions
 const authProvider = browserAuth({
-  launch: open,
   store: fileStore(),
 });
 ```
