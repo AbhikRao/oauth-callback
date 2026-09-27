@@ -3,8 +3,10 @@
 
 /**
  * browserAuth() against the real MCP SDK on both sides. The resource server (metadata,
- * 401 challenge, MCP transport) is the SDK's own, so protocol drift between SDK client and
+ * 401 challenge, MCP handler) is the SDK's own, so protocol drift between SDK client and
  * server can't hide behind test/mock-mcp-server.ts; only the authorization server is a fixture.
+ * It lives on another origin, so the SDK's fallback of treating the MCP origin as the
+ * authorization server finds nothing: only protected-resource discovery leads to it.
  */
 
 import {
@@ -13,13 +15,13 @@ import {
   UnauthorizedError,
 } from "@modelcontextprotocol/client";
 import {
+  buildOAuthProtectedResourceMetadata,
+  createMcpHandler,
   getOAuthProtectedResourceMetadataUrl,
   McpServer,
   OAuthError,
   OAuthErrorCode,
-  oauthMetadataResponse,
   requireBearerAuth,
-  WebStandardStreamableHTTPServerTransport,
 } from "@modelcontextprotocol/server";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
@@ -29,15 +31,17 @@ import { freePort } from "./helpers";
 let fixture: Awaited<ReturnType<typeof startFixture>>;
 const clients: Client[] = [];
 
-beforeEach(async () => (fixture = await startFixture()));
+beforeEach(async () => {
+  fixture = await startFixture();
+});
 
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((c) => c.close().catch(() => {})));
   await fixture.close();
 });
 
-const newClient = () => {
-  const client = new Client({ name: "test", version: "1.0.0" });
+const newClient = (options?: ConstructorParameters<typeof Client>[1]) => {
+  const client = new Client({ name: "test", version: "1.0.0" }, options);
   clients.push(client);
   return client;
 };
@@ -48,112 +52,127 @@ const setup = async () =>
     serverUrl: fixture.mcpUrl,
     redirectUri: `http://127.0.0.1:${await freePort()}/callback`,
     clientName: "oauth-callback-test",
-    launch: async (url) => void (await fetch(url)).body?.cancel(),
+    // Fail fast on a refused authorization request instead of waiting out the flow timeout.
+    launch: async (url) => {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(await response.text());
+      await response.body?.cancel();
+    },
     timeout: 5000,
   });
 
-/** The tool echoes the client the SDK's bearer check verified. */
+/** The tool echoes the client the SDK's bearer check verified for the issued token. */
 const expectAuthorized = async (client: Client) =>
   expect(await client.callTool({ name: "whoami" })).toMatchObject({
     content: [{ type: "text", text: "fixture-client" }],
   });
 
-test("connect() authorizes on the 401 and reconnects in one call", async () => {
-  const client = newClient();
+test("connect() authorizes on the 401 and reconnects, on the current protocol", async () => {
+  const client = newClient({ versionNegotiation: { mode: "auto" } });
   await (await setup()).connect(client);
+  expect(client.getProtocolEra()).toBe("modern");
   await expectAuthorized(client);
 });
 
-test("your own transport: complete the flow, then retry on a fresh transport", async () => {
+test("your own transport: complete the flow, then retry on a fresh transport (2025 protocol)", async () => {
   const auth = await setup();
-  const transport = () =>
+  const newTransport = () =>
     new StreamableHTTPClientTransport(fixture.mcpUrl, { authProvider: auth });
   const client = newClient();
-  const first = transport();
+  const first = newTransport();
   await expect(client.connect(first)).rejects.toBeInstanceOf(UnauthorizedError);
   await auth.completeAuthorization(first);
   await first.close();
-  await client.connect(transport());
+  await client.connect(newTransport());
+  expect(client.getProtocolEra()).toBe("legacy");
   await expectAuthorized(client);
 });
 
-/** SDK resource server + a minimal authorization server (DCR, S256 PKCE) on one origin. */
+/**
+ * SDK resource server + a minimal authorization server on its own origin. The AS enforces
+ * what this flow depends on: a DCR'd loopback redirect URI, state, S256 PKCE, the RFC 8707
+ * resource, and codes bound to client, redirect URI, challenge and resource; it returns
+ * RFC 9207 `iss` on the callback.
+ */
 async function startFixture() {
-  const mcp = new McpServer({ name: "fixture", version: "1.0.0" });
-  mcp.registerTool("whoami", {}, async (ctx) => ({
-    content: [{ type: "text", text: ctx.http?.authInfo?.clientId ?? "" }],
-  }));
-  const transport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: randomUUID,
-    enableJsonResponse: true,
+  const mcp = createMcpHandler(() => {
+    const server = new McpServer({ name: "fixture", version: "1.0.0" });
+    server.registerTool("whoami", {}, async (ctx) => ({
+      content: [{ type: "text", text: ctx.http?.authInfo?.clientId ?? "" }],
+    }));
+    return server;
   });
-  await mcp.connect(transport);
 
-  const codes = new Map<string, { challenge: string; redirectUri: string }>();
-  const tokens = new Set<string>();
-  let origin = "";
-  let requireAuth: ReturnType<typeof requireBearerAuth>;
+  const clientId = "fixture-client";
+  let registeredRedirectUri: string | undefined;
+  const codes = new Map<
+    string,
+    { challenge: string; redirectUri: string; resource: string }
+  >();
+  const tokens = new Map<string, string>(); // access token → client_id
+  const bad = (reason: string) => new Response(reason, { status: 400 });
 
-  const server = Bun.serve({
+  const as = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    async fetch(request) {
+    async fetch(request): Promise<Response> {
       const url = new URL(request.url);
-      const metadata = oauthMetadataResponse(request, {
-        resourceServerUrl: new URL("/mcp", origin),
-        oauthMetadata: {
-          issuer: origin,
-          authorization_endpoint: `${origin}/authorize`,
-          token_endpoint: `${origin}/token`,
-          registration_endpoint: `${origin}/register`,
-          response_types_supported: ["code"],
-          code_challenge_methods_supported: ["S256"],
-        },
-        dangerouslyAllowInsecureIssuerUrl: true,
-      });
-      if (metadata) return metadata;
-
-      if (url.pathname === "/mcp") {
-        const auth = await requireAuth(request);
-        if (auth instanceof Response) return auth;
-        return transport.handleRequest(request, { authInfo: auth });
-      }
+      if (url.pathname === "/.well-known/oauth-authorization-server")
+        return Response.json(asMetadata);
       if (url.pathname === "/register" && request.method === "POST") {
-        const body = (await request.json()) as Record<string, unknown>;
-        return Response.json({ ...body, client_id: "fixture-client" }, 201);
+        const body = (await request.json()) as { redirect_uris?: unknown };
+        const uris = body.redirect_uris;
+        if (
+          !Array.isArray(uris) ||
+          uris.length !== 1 ||
+          !String(uris[0]).startsWith("http://127.0.0.1:")
+        )
+          return bad("redirect_uris");
+        registeredRedirectUri = uris[0];
+        return Response.json({ ...body, client_id: clientId }, 201);
       }
       if (url.pathname === "/authorize") {
-        // Plays the user approving: redirect back with a code bound to the PKCE challenge.
-        const params = url.searchParams;
-        if (params.get("code_challenge_method") !== "S256")
-          return new Response("S256 required", { status: 400 });
+        // Plays the user approving: redirect back with a code bound to this request.
+        const p = url.searchParams;
+        const redirectUri = p.get("redirect_uri");
+        const state = p.get("state");
+        const challenge = p.get("code_challenge");
+        const resource = p.get("resource");
+        if (p.get("response_type") !== "code") return bad("response_type");
+        if (p.get("client_id") !== clientId) return bad("client_id");
+        if (!redirectUri || redirectUri !== registeredRedirectUri)
+          return bad("redirect_uri");
+        if (!state) return bad("state");
+        if (!challenge || p.get("code_challenge_method") !== "S256")
+          return bad("code_challenge");
+        if (resource !== mcpUrl.href) return bad("resource");
         const code = randomUUID();
-        codes.set(code, {
-          challenge: params.get("code_challenge")!,
-          redirectUri: params.get("redirect_uri")!,
-        });
-        const callback = new URL(params.get("redirect_uri")!);
+        codes.set(code, { challenge, redirectUri, resource });
+        const callback = new URL(redirectUri);
         callback.searchParams.set("code", code);
-        callback.searchParams.set("state", params.get("state")!);
+        callback.searchParams.set("state", state);
+        callback.searchParams.set("iss", asMetadata.issuer);
         return Response.redirect(callback.href, 302);
       }
       if (url.pathname === "/token" && request.method === "POST") {
         const form = new URLSearchParams(await request.text());
-        const grant = codes.get(form.get("code") ?? "");
+        const code = form.get("code") ?? "";
+        const grant = codes.get(code);
+        codes.delete(code);
         const challenge = createHash("sha256")
           .update(form.get("code_verifier") ?? "")
           .digest("base64url");
         if (
           !grant ||
           form.get("grant_type") !== "authorization_code" ||
-          form.get("client_id") !== "fixture-client" ||
+          form.get("client_id") !== clientId ||
           form.get("redirect_uri") !== grant.redirectUri ||
+          form.get("resource") !== grant.resource ||
           challenge !== grant.challenge
         )
           return Response.json({ error: "invalid_grant" }, { status: 400 });
-        codes.delete(form.get("code")!);
         const token = randomUUID();
-        tokens.add(token);
+        tokens.set(token, clientId);
         return Response.json({
           access_token: token,
           token_type: "Bearer",
@@ -163,17 +182,50 @@ async function startFixture() {
       return new Response("Not found", { status: 404 });
     },
   });
-  origin = server.url.origin;
-  const mcpUrl = new URL("/mcp", origin);
+  const asMetadata = {
+    issuer: as.url.origin,
+    authorization_endpoint: `${as.url.origin}/authorize`,
+    token_endpoint: `${as.url.origin}/token`,
+    registration_endpoint: `${as.url.origin}/register`,
+    response_types_supported: ["code"],
+    code_challenge_methods_supported: ["S256"],
+    authorization_response_iss_parameter_supported: true,
+  };
+
+  let requireAuth: ReturnType<typeof requireBearerAuth>;
+  const rs = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request): Promise<Response> {
+      const url = new URL(request.url);
+      if (url.href === resourceMetadataUrl)
+        return Response.json(
+          buildOAuthProtectedResourceMetadata({
+            resourceServerUrl: mcpUrl,
+            oauthMetadata: asMetadata,
+            dangerouslyAllowInsecureIssuerUrl: true,
+          }),
+        );
+      if (url.pathname === "/mcp") {
+        const auth = await requireAuth(request);
+        if (auth instanceof Response) return auth;
+        return mcp.fetch(request, { authInfo: auth });
+      }
+      return new Response("Not found", { status: 404 });
+    },
+  });
+  const mcpUrl = new URL("/mcp", rs.url);
+  const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(mcpUrl);
   requireAuth = requireBearerAuth({
-    resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl),
+    resourceMetadataUrl,
     verifier: {
       async verifyAccessToken(token) {
-        if (!tokens.has(token))
+        const clientId = tokens.get(token);
+        if (!clientId)
           throw new OAuthError(OAuthErrorCode.InvalidToken, "Unknown token");
         return {
           token,
-          clientId: "fixture-client",
+          clientId,
           scopes: [],
           expiresAt: Math.floor(Date.now() / 1000) + 3600,
         };
@@ -185,7 +237,7 @@ async function startFixture() {
     mcpUrl,
     async close() {
       await mcp.close().catch(() => {});
-      await server.stop(true);
+      await Promise.all([rs.stop(true), as.stop(true)]);
     },
   };
 }
