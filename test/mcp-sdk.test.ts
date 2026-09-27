@@ -2,8 +2,9 @@
 /* SPDX-License-Identifier: MIT */
 
 /**
- * browserAuth() against the real MCP SDK on both sides: a real McpServer behind an
- * independent OAuth fixture, so a hand-rolled mock can't hide protocol drift.
+ * browserAuth() against the real MCP SDK on both sides. The resource server (metadata,
+ * 401 challenge, MCP transport) is the SDK's own, so protocol drift between SDK client and
+ * server can't hide behind test/mock-mcp-server.ts; only the authorization server is a fixture.
  */
 
 import {
@@ -12,191 +13,179 @@ import {
   UnauthorizedError,
 } from "@modelcontextprotocol/client";
 import {
+  getOAuthProtectedResourceMetadataUrl,
   McpServer,
+  OAuthError,
+  OAuthErrorCode,
+  oauthMetadataResponse,
+  requireBearerAuth,
   WebStandardStreamableHTTPServerTransport,
 } from "@modelcontextprotocol/server";
-import { expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { browserAuth } from "../src/mcp/index";
 import { freePort } from "./helpers";
 
-const timeoutMs = 15_000;
+let fixture: Awaited<ReturnType<typeof startFixture>>;
+const clients: Client[] = [];
 
-test(
-  "browserAuth completes a real MCP SDK OAuth flow against a local fixture",
-  async () => {
-    const calls: string[] = [];
-    let origin = "";
-    let mcpUrl = "";
-    let resourceMetadataUrl = "";
-    let authorizationChallenge: string | undefined;
-    let redirectUri: string | undefined;
-    const mcp = new McpServer({
-      name: "local-oauth-fixture",
-      version: "1.0.0",
-    });
-    const mcpTransport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: randomUUID,
-      enableJsonResponse: true,
-    });
-    let server: ReturnType<typeof Bun.serve> | undefined;
-    const client = new Client(
-      { name: "oauth-callback-integration-test", version: "1.0.0" },
-      { capabilities: {} },
-    );
+beforeEach(async () => (fixture = await startFixture()));
 
-    try {
-      mcp.registerTool("fixture_status", {}, async () => ({
-        content: [{ type: "text", text: "authenticated" }],
-      }));
-      await mcp.connect(mcpTransport);
+afterEach(async () => {
+  await Promise.all(clients.splice(0).map((c) => c.close().catch(() => {})));
+  await fixture.close();
+});
 
-      server = Bun.serve({
-        hostname: "127.0.0.1",
-        port: 0,
-        async fetch(request) {
-          const url = new URL(request.url);
-          calls.push(`${request.method} ${url.pathname}`);
+const newClient = () => {
+  const client = new Client({ name: "test", version: "1.0.0" });
+  clients.push(client);
+  return client;
+};
 
-          if (url.pathname === "/.well-known/oauth-protected-resource") {
-            return Response.json({
-              resource: mcpUrl,
-              authorization_servers: [origin],
-            });
-          }
-          if (url.pathname === "/.well-known/oauth-authorization-server") {
-            return Response.json({
-              issuer: origin,
-              authorization_endpoint: `${origin}/authorize`,
-              token_endpoint: `${origin}/token`,
-              registration_endpoint: `${origin}/register`,
-              response_types_supported: ["code"],
-              grant_types_supported: ["authorization_code"],
-              token_endpoint_auth_methods_supported: ["none"],
-              code_challenge_methods_supported: ["S256"],
-            });
-          }
-          if (url.pathname === "/register" && request.method === "POST") {
-            const registration = (await request.json()) as {
-              redirect_uris?: string[];
-            };
-            return Response.json({
-              client_id: "fixture-client",
-              redirect_uris: registration.redirect_uris,
-              grant_types: ["authorization_code"],
-              response_types: ["code"],
-              token_endpoint_auth_method: "none",
-            });
-          }
-          if (url.pathname === "/authorize") {
-            const callbackUri = url.searchParams.get("redirect_uri");
-            const state = url.searchParams.get("state");
-            const challenge = url.searchParams.get("code_challenge");
-            if (
-              !callbackUri ||
-              !state ||
-              !challenge ||
-              url.searchParams.get("code_challenge_method") !== "S256"
-            ) {
-              return new Response("Invalid authorization request", {
-                status: 400,
-              });
-            }
-            authorizationChallenge = challenge;
-            redirectUri = callbackUri;
-            const callback = new URL(callbackUri);
-            callback.searchParams.set("code", "fixture-code");
-            callback.searchParams.set("state", state);
-            return Response.redirect(callback.href, 302);
-          }
-          if (url.pathname === "/token" && request.method === "POST") {
-            const form = new URLSearchParams(await request.text());
-            const verifier = form.get("code_verifier");
-            const expectedChallenge = authorizationChallenge;
-            if (
-              form.get("grant_type") !== "authorization_code" ||
-              form.get("code") !== "fixture-code" ||
-              form.get("client_id") !== "fixture-client" ||
-              form.get("redirect_uri") !== redirectUri ||
-              !verifier ||
-              !expectedChallenge ||
-              createHash("sha256").update(verifier).digest("base64url") !==
-                expectedChallenge
-            ) {
-              return Response.json({ error: "invalid_grant" }, { status: 400 });
-            }
-            return Response.json({
-              access_token: "fixture-access-token",
-              token_type: "Bearer",
-              expires_in: 3600,
-            });
-          }
-          if (url.pathname === "/mcp") {
-            if (
-              request.headers.get("authorization") !==
-              "Bearer fixture-access-token"
-            ) {
-              return new Response(null, {
-                status: 401,
-                headers: {
-                  "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadataUrl}"`,
-                },
-              });
-            }
-            return mcpTransport.handleRequest(request);
-          }
-          return new Response("Not found", { status: 404 });
+/** Provider whose "browser" follows the authorization redirect back to the loopback listener. */
+const setup = async () =>
+  browserAuth({
+    serverUrl: fixture.mcpUrl,
+    redirectUri: `http://127.0.0.1:${await freePort()}/callback`,
+    clientName: "oauth-callback-test",
+    launch: async (url) => void (await fetch(url)).body?.cancel(),
+    timeout: 5000,
+  });
+
+/** The tool echoes the client the SDK's bearer check verified. */
+const expectAuthorized = async (client: Client) =>
+  expect(await client.callTool({ name: "whoami" })).toMatchObject({
+    content: [{ type: "text", text: "fixture-client" }],
+  });
+
+test("connect() authorizes on the 401 and reconnects in one call", async () => {
+  const client = newClient();
+  await (await setup()).connect(client);
+  await expectAuthorized(client);
+});
+
+test("your own transport: complete the flow, then retry on a fresh transport", async () => {
+  const auth = await setup();
+  const transport = () =>
+    new StreamableHTTPClientTransport(fixture.mcpUrl, { authProvider: auth });
+  const client = newClient();
+  const first = transport();
+  await expect(client.connect(first)).rejects.toBeInstanceOf(UnauthorizedError);
+  await auth.completeAuthorization(first);
+  await first.close();
+  await client.connect(transport());
+  await expectAuthorized(client);
+});
+
+/** SDK resource server + a minimal authorization server (DCR, S256 PKCE) on one origin. */
+async function startFixture() {
+  const mcp = new McpServer({ name: "fixture", version: "1.0.0" });
+  mcp.registerTool("whoami", {}, async (ctx) => ({
+    content: [{ type: "text", text: ctx.http?.authInfo?.clientId ?? "" }],
+  }));
+  const transport = new WebStandardStreamableHTTPServerTransport({
+    sessionIdGenerator: randomUUID,
+    enableJsonResponse: true,
+  });
+  await mcp.connect(transport);
+
+  const codes = new Map<string, { challenge: string; redirectUri: string }>();
+  const tokens = new Set<string>();
+  let origin = "";
+  let requireAuth: ReturnType<typeof requireBearerAuth>;
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const metadata = oauthMetadataResponse(request, {
+        resourceServerUrl: new URL("/mcp", origin),
+        oauthMetadata: {
+          issuer: origin,
+          authorization_endpoint: `${origin}/authorize`,
+          token_endpoint: `${origin}/token`,
+          registration_endpoint: `${origin}/register`,
+          response_types_supported: ["code"],
+          code_challenge_methods_supported: ["S256"],
         },
+        dangerouslyAllowInsecureIssuerUrl: true,
       });
-      origin = server.url.origin;
-      mcpUrl = `${origin}/mcp`;
-      resourceMetadataUrl = `${origin}/.well-known/oauth-protected-resource`;
+      if (metadata) return metadata;
 
-      const provider = browserAuth({
-        serverUrl: mcpUrl,
-        redirectUri: `http://127.0.0.1:${await freePort()}/callback`,
-        clientName: "oauth-callback-integration-test",
-        timeout: timeoutMs,
-        launch: async (authorizationUrl) => {
-          expect(new URL(authorizationUrl).origin).toBe(origin);
-          const response = await fetch(authorizationUrl);
-          expect(response.ok).toBe(true);
-          await response.body?.cancel();
-        },
-      });
-
-      const createTransport = () =>
-        new StreamableHTTPClientTransport(new URL(mcpUrl), {
-          authProvider: provider,
+      if (url.pathname === "/mcp") {
+        const auth = await requireAuth(request);
+        if (auth instanceof Response) return auth;
+        return transport.handleRequest(request, { authInfo: auth });
+      }
+      if (url.pathname === "/register" && request.method === "POST") {
+        const body = (await request.json()) as Record<string, unknown>;
+        return Response.json({ ...body, client_id: "fixture-client" }, 201);
+      }
+      if (url.pathname === "/authorize") {
+        // Plays the user approving: redirect back with a code bound to the PKCE challenge.
+        const params = url.searchParams;
+        if (params.get("code_challenge_method") !== "S256")
+          return new Response("S256 required", { status: 400 });
+        const code = randomUUID();
+        codes.set(code, {
+          challenge: params.get("code_challenge")!,
+          redirectUri: params.get("redirect_uri")!,
         });
+        const callback = new URL(params.get("redirect_uri")!);
+        callback.searchParams.set("code", code);
+        callback.searchParams.set("state", params.get("state")!);
+        return Response.redirect(callback.href, 302);
+      }
+      if (url.pathname === "/token" && request.method === "POST") {
+        const form = new URLSearchParams(await request.text());
+        const grant = codes.get(form.get("code") ?? "");
+        const challenge = createHash("sha256")
+          .update(form.get("code_verifier") ?? "")
+          .digest("base64url");
+        if (
+          !grant ||
+          form.get("grant_type") !== "authorization_code" ||
+          form.get("client_id") !== "fixture-client" ||
+          form.get("redirect_uri") !== grant.redirectUri ||
+          challenge !== grant.challenge
+        )
+          return Response.json({ error: "invalid_grant" }, { status: 400 });
+        codes.delete(form.get("code")!);
+        const token = randomUUID();
+        tokens.add(token);
+        return Response.json({
+          access_token: token,
+          token_type: "Bearer",
+          expires_in: 3600,
+        });
+      }
+      return new Response("Not found", { status: 404 });
+    },
+  });
+  origin = server.url.origin;
+  const mcpUrl = new URL("/mcp", origin);
+  requireAuth = requireBearerAuth({
+    resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl),
+    verifier: {
+      async verifyAccessToken(token) {
+        if (!tokens.has(token))
+          throw new OAuthError(OAuthErrorCode.InvalidToken, "Unknown token");
+        return {
+          token,
+          clientId: "fixture-client",
+          scopes: [],
+          expiresAt: Math.floor(Date.now() / 1000) + 3600,
+        };
+      },
+    },
+  });
 
-      // Caller-owned transport: UnauthorizedError, then completeAuthorization() and a fresh transport.
-      const initial = createTransport();
-      await expect(client.connect(initial)).rejects.toBeInstanceOf(
-        UnauthorizedError,
-      );
-      await provider.completeAuthorization(initial);
-      await initial.close();
-      expect(await provider.tokens()).toMatchObject({
-        access_token: "fixture-access-token",
-      });
-
-      await client.connect(createTransport());
-      const result = await client.callTool({ name: "fixture_status" });
-
-      expect(result).toMatchObject({
-        content: [{ type: "text", text: "authenticated" }],
-      });
-      expect(calls.some((call) => call.endsWith(" /register"))).toBe(true);
-      expect(calls.some((call) => call.endsWith(" /authorize"))).toBe(true);
-      expect(calls.some((call) => call.endsWith(" /token"))).toBe(true);
-      expect(calls.some((call) => call.endsWith(" /mcp"))).toBe(true);
-      expect(authorizationChallenge).toBeDefined();
-    } finally {
-      await client.close().catch(() => undefined);
-      await mcp.close().catch(() => undefined);
-      server?.stop(true);
-    }
-  },
-  timeoutMs,
-);
+  return {
+    mcpUrl,
+    async close() {
+      await mcp.close().catch(() => {});
+      await server.stop(true);
+    },
+  };
+}
