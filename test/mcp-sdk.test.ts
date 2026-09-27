@@ -1,34 +1,26 @@
 /* SPDX-FileCopyrightText: 2025-present Kriasoft */
 /* SPDX-License-Identifier: MIT */
 
-import { createHash, randomUUID } from "node:crypto";
-import { createServer } from "node:net";
+/**
+ * browserAuth() against the real MCP SDK on both sides: a real McpServer behind an
+ * independent OAuth fixture, so a hand-rolled mock can't hide protocol drift.
+ */
+
+import {
+  Client,
+  StreamableHTTPClientTransport,
+  UnauthorizedError,
+} from "@modelcontextprotocol/client";
+import {
+  McpServer,
+  WebStandardStreamableHTTPServerTransport,
+} from "@modelcontextprotocol/server";
 import { expect, test } from "bun:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { browserAuth } from "../src/mcp";
+import { createHash, randomUUID } from "node:crypto";
+import { browserAuth } from "../src/mcp/index";
+import { freePort } from "./helpers";
 
 const timeoutMs = 15_000;
-
-async function unusedPort(): Promise<number> {
-  const reservation = createServer();
-  await new Promise<void>((resolve, reject) => {
-    reservation.once("error", reject);
-    reservation.listen(0, "127.0.0.1", resolve);
-  });
-  const address = reservation.address();
-  if (!address || typeof address === "string") {
-    reservation.close();
-    throw new Error("Could not reserve a local port");
-  }
-  await new Promise<void>((resolve, reject) =>
-    reservation.close((error) => (error ? reject(error) : resolve())),
-  );
-  return address.port;
-}
 
 test(
   "browserAuth completes a real MCP SDK OAuth flow against a local fixture",
@@ -115,7 +107,7 @@ test(
             const callback = new URL(callbackUri);
             callback.searchParams.set("code", "fixture-code");
             callback.searchParams.set("state", state);
-            return Response.redirect(callback, 302);
+            return Response.redirect(callback.href, 302);
           }
           if (url.pathname === "/token" && request.method === "POST") {
             const form = new URLSearchParams(await request.text());
@@ -161,9 +153,10 @@ test(
       resourceMetadataUrl = `${origin}/.well-known/oauth-protected-resource`;
 
       const provider = browserAuth({
-        port: await unusedPort(),
-        hostname: "127.0.0.1",
-        authTimeout: timeoutMs,
+        serverUrl: mcpUrl,
+        redirectUri: `http://127.0.0.1:${await freePort()}/callback`,
+        clientName: "oauth-callback-integration-test",
+        timeout: timeoutMs,
         launch: async (authorizationUrl) => {
           expect(new URL(authorizationUrl).origin).toBe(origin);
           const response = await fetch(authorizationUrl);
@@ -177,13 +170,13 @@ test(
           authProvider: provider,
         });
 
-      let initialConnectError: unknown;
-      try {
-        await client.connect(createTransport());
-      } catch (error) {
-        initialConnectError = error;
-      }
-      expect(initialConnectError).toBeInstanceOf(UnauthorizedError);
+      // Caller-owned transport: UnauthorizedError, then completeAuthorization() and a fresh transport.
+      const initial = createTransport();
+      await expect(client.connect(initial)).rejects.toBeInstanceOf(
+        UnauthorizedError,
+      );
+      await provider.completeAuthorization(initial);
+      await initial.close();
       expect(await provider.tokens()).toMatchObject({
         access_token: "fixture-access-token",
       });

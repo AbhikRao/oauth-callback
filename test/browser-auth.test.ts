@@ -1,0 +1,1275 @@
+/* SPDX-FileCopyrightText: 2025-present Kriasoft */
+/* SPDX-License-Identifier: MIT */
+
+import {
+  AuthorizationServerMismatchError,
+  Client,
+  StreamableHTTPClientTransport,
+  UnauthorizedError,
+} from "@modelcontextprotocol/client";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  browserAuth,
+  fileStore,
+  type BrowserAuthOptions,
+  type CredentialStore,
+} from "../src/mcp/index";
+import { freePort, sleep } from "./helpers";
+import { startMockServer, type MockServer } from "./mock-mcp-server";
+
+let mock: MockServer;
+let redirectUri: string;
+const clients: Client[] = [];
+
+beforeEach(async () => {
+  mock = await startMockServer();
+  redirectUri = `http://127.0.0.1:${await freePort()}/callback`;
+});
+
+afterEach(async () => {
+  await Promise.all(clients.splice(0).map((c) => c.close().catch(() => {})));
+  await mock.close();
+});
+
+const newClient = () => {
+  const client = new Client({ name: "test", version: "1.0.0" });
+  clients.push(client);
+  return client;
+};
+
+/** Provider whose "browser" approves immediately. */
+const setup = (options: Partial<BrowserAuthOptions> = {}) =>
+  browserAuth({
+    serverUrl: mock.mcpUrl,
+    redirectUri,
+    ...(options.clientInformation ? {} : { clientName: "Test CLI" }),
+    launch: (url) => void mock.authorize(url),
+    timeout: 5000,
+    ...options,
+  });
+
+/** Sign-out fails stale work plainly; "client"/"tokens" supersede it, so it may retry. */
+const expectEnded = (error: unknown, scope: "all" | "client" | "tokens") => {
+  if (scope === "all") {
+    expect(error).not.toBeInstanceOf(UnauthorizedError);
+    expect((error as Error).message).toMatch(/invalidated/);
+  } else expect(error).toBeInstanceOf(UnauthorizedError);
+};
+
+/** A store holding client "a" and its tokens, as after a completed authorization. */
+const authorized = () => {
+  const store = memory();
+  const issuer = "https://as";
+  store.value = JSON.stringify({
+    version: 1,
+    serverUrl: new URL(mock.mcpUrl).href,
+    client: { client_id: "a", issuer, redirect_uris: [redirectUri] },
+    tokens: {
+      access_token: "old",
+      token_type: "Bearer",
+      issuer,
+      client_id: "a",
+    },
+  });
+  return store;
+};
+
+const memory = (): CredentialStore & { value?: string } => {
+  const store: CredentialStore & { value?: string } = {
+    load: async () => store.value,
+    save: async (v) => void (store.value = v),
+  };
+  return store;
+};
+
+describe("connect()", () => {
+  test("authorizes in the browser and connects", async () => {
+    const auth = setup();
+    const client = newClient();
+    await auth.connect(client);
+    expect(await client.listTools()).toEqual({ tools: [] });
+    expect(mock.authorizeRequests).toHaveLength(1);
+  });
+
+  test("DCR carries the SDK's defaults; the adapter adds neither", async () => {
+    const auth = setup();
+    expect(auth.clientMetadata).toEqual({
+      client_name: "Test CLI",
+      redirect_uris: [redirectUri],
+      response_types: ["code"],
+    });
+    await auth.connect(newClient());
+    expect(mock.registrations[0]).toMatchObject({
+      grant_types: ["authorization_code", "refresh_token"],
+      application_type: "native",
+      redirect_uris: [redirectUri],
+    });
+  });
+
+  test("adapter-owned metadata can't be overridden by untyped callers", () => {
+    const auth = setup({
+      clientMetadata: {
+        scope: "read",
+        redirect_uris: ["https://evil"],
+        client_name: "x",
+      } as never,
+    });
+    expect(auth.clientMetadata).toEqual({
+      scope: "read",
+      client_name: "Test CLI",
+      redirect_uris: [redirectUri],
+      response_types: ["code"],
+    });
+  });
+
+  test("offline_access only when the caller declares refresh_token", async () => {
+    await mock.close();
+    mock = await startMockServer({
+      resourceScopes: ["read"],
+      serverScopes: ["read", "offline_access"],
+    });
+    await setup().connect(newClient());
+    expect(mock.authorizeRequests[0]!.searchParams.get("scope")).toBe("read");
+
+    const other = setup({
+      redirectUri: `http://127.0.0.1:${await freePort()}/callback`,
+      clientMetadata: { grant_types: ["authorization_code", "refresh_token"] },
+    });
+    await other.connect(newClient());
+    expect(
+      mock.authorizeRequests[1]!.searchParams.get("scope")?.split(" "),
+    ).toContain("offline_access");
+  });
+
+  test("a second process reuses stored credentials without a browser", async () => {
+    const store = memory();
+    await setup({ store }).connect(newClient());
+    const second = setup({
+      store,
+      launch: () => Promise.reject(new Error("browser opened")),
+    });
+    await second.connect(newClient());
+    expect(mock.authorizeRequests).toHaveLength(1);
+  });
+
+  test("an expired access token is refreshed with the stored refresh token", async () => {
+    const store = memory();
+    await setup({ store }).connect(newClient());
+    const doc = JSON.parse(store.value!);
+    doc.tokens.access_token = "expired";
+    store.value = JSON.stringify(doc);
+
+    const second = setup({
+      store,
+      launch: () => Promise.reject(new Error("browser opened")),
+    });
+    const client = newClient();
+    await second.connect(client);
+    expect(await client.listTools()).toEqual({ tools: [] });
+    expect(mock.tokenRequests.at(-1)!.get("grant_type")).toBe("refresh_token");
+    expect(JSON.parse(store.value!).tokens.access_token).not.toBe("expired");
+  });
+
+  test("a revoked refresh token falls back to the browser in the same call", async () => {
+    const store = memory();
+    await setup({ store }).connect(newClient());
+    const doc = JSON.parse(store.value!);
+    doc.tokens.access_token = "expired";
+    doc.tokens.refresh_token = "revoked";
+    store.value = JSON.stringify(doc);
+
+    // The SDK answers invalid_grant with invalidateCredentials("tokens"), then reauthorizes.
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      await setup({ store }).connect(newClient());
+    } finally {
+      console.warn = warn;
+    }
+    expect(mock.authorizeRequests).toHaveLength(2);
+    expect(JSON.parse(store.value!).tokens.access_token).not.toBe("expired");
+  });
+
+  test("discovery written by another attempt doesn't leak into a pending flow", async () => {
+    let auth!: ReturnType<typeof setup>;
+    auth = setup({
+      launch: (url) => {
+        auth.saveDiscoveryState!({
+          authorizationServerUrl: "https://other-as.example.com/",
+        });
+        void mock.authorize(url);
+      },
+    });
+    await auth.connect(newClient());
+  });
+
+  test("invalidating discovery during a pending flow doesn't break its exchange", async () => {
+    let auth!: ReturnType<typeof setup>;
+    auth = setup({
+      launch: async (url) => {
+        await auth.invalidateCredentials("discovery");
+        void mock.authorize(url);
+      },
+    });
+    await auth.connect(newClient());
+  });
+
+  test("a hung launcher doesn't block the flow", async () => {
+    const auth = setup({
+      launch: (url) => {
+        void mock.authorize(url);
+        return new Promise(() => {});
+      },
+    });
+    await auth.connect(newClient());
+  });
+
+  test("a rejecting launcher fails connect() with its error, then the next flow works", async () => {
+    const err = new Error("no browser");
+    let fail = true;
+    const auth = setup({
+      launch: (url) => (fail ? Promise.reject(err) : void mock.authorize(url)),
+    });
+    await expect(auth.connect(newClient())).rejects.toBe(err);
+    fail = false;
+    await auth.connect(newClient());
+  });
+
+  test("an error callback with a foreign iss never surfaces its description", async () => {
+    const auth = setup({
+      launch: (url) =>
+        void mock.authorize(url, {
+          code: "",
+          error: "access_denied",
+          error_description: "EVIL TEXT",
+          iss: "https://evil.example.com",
+        }),
+    });
+    const error = await auth.connect(newClient()).catch((e) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error.message)).not.toContain("EVIL TEXT");
+  });
+
+  test("an error callback from the real issuer surfaces the SDK OAuthError", async () => {
+    const auth = setup({
+      launch: (url) =>
+        void mock.authorize(url, { code: "", error: "access_denied" }),
+    });
+    const error = await auth.connect(newClient()).catch((e) => e);
+    expect(error.code ?? error.error).toBe("access_denied");
+  });
+
+  test("a failed exchange releases the flow", async () => {
+    const auth = setup();
+    mock.knobs.tokenError = "server_error";
+    await expect(auth.connect(newClient())).rejects.toThrow();
+    await auth.connect(newClient());
+  });
+
+  test("timeout rejects with TimeoutError and releases the flow", async () => {
+    let respond = false;
+    const auth = setup({
+      timeout: 100,
+      launch: (url) => void (respond && mock.authorize(url)),
+    });
+    const error = await auth.connect(newClient()).catch((e) => e);
+    expect(error.name).toBe("TimeoutError");
+    respond = true;
+    await auth.connect(newClient());
+  });
+
+  test("abort during the browser wait rejects promptly and releases the flow", async () => {
+    let respond = false;
+    const auth = setup({
+      launch: (url) => void (respond && mock.authorize(url)),
+    });
+    const controller = new AbortController();
+    const reason = new Error("cancelled");
+    setTimeout(() => controller.abort(reason), 50);
+    const started = Date.now();
+    await expect(
+      auth.connect(newClient(), { signal: controller.signal }),
+    ).rejects.toBe(reason);
+    expect(Date.now() - started).toBeLessThan(1000);
+    respond = true;
+    await auth.connect(newClient());
+  });
+
+  test("abort during a slow registration never opens the browser later", async () => {
+    mock.knobs.registerDelay = 200;
+    let launched = false;
+    const auth = setup({ launch: () => void (launched = true) });
+    const controller = new AbortController();
+    const reason = new Error("cancelled");
+    setTimeout(() => controller.abort(reason), 50);
+    await expect(
+      auth.connect(newClient(), { signal: controller.signal }),
+    ).rejects.toBe(reason);
+    await sleep(300);
+    expect(launched).toBe(false);
+    expect(await auth.state!()).toBeString(); // no flow left behind
+  });
+
+  test("an already aborted signal rejects before any side effect", async () => {
+    const auth = setup();
+    const reason = new Error("cancelled");
+    await expect(
+      auth.connect(newClient(), { signal: AbortSignal.abort(reason) }),
+    ).rejects.toBe(reason);
+    expect(mock.registrations).toHaveLength(0);
+  });
+
+  test("a hung token endpoint is aborted when the flow times out; the next flow works", async () => {
+    mock.knobs.tokenDelay = 10_000;
+    const auth = setup({ timeout: 300 });
+    const started = Date.now();
+    await expect(auth.connect(newClient())).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(2000);
+    mock.knobs.tokenDelay = 0;
+    await auth.connect(newClient());
+  });
+
+  test("concurrent connect() calls are serialized: one browser trip, one registration", async () => {
+    const auth = setup();
+    await Promise.all([auth.connect(newClient()), auth.connect(newClient())]);
+    expect(mock.authorizeRequests).toHaveLength(1);
+    expect(mock.registrations).toHaveLength(1);
+  });
+
+  test("the connect() signal bounds OAuth requests, not the SSE stream it outlives", async () => {
+    const controller = new AbortController();
+    const requests: { url: string; method?: string; signal?: AbortSignal }[] =
+      [];
+    const auth = setup();
+    await auth.connect(newClient(), {
+      signal: controller.signal,
+      transportOptions: {
+        fetch: (url, init) => {
+          requests.push({
+            url: String(url),
+            method: init?.method,
+            signal: init?.signal ?? undefined,
+          });
+          return fetch(url, init);
+        },
+      },
+    });
+    controller.abort();
+    const sse = requests.find(
+      (r) => r.url === mock.mcpUrl && r.method === "GET",
+    );
+    expect(sse).toBeDefined();
+    expect(sse!.signal?.aborted).not.toBe(true);
+    const oauth = requests.filter((r) => r.url !== mock.mcpUrl);
+    expect(oauth.every((r) => r.signal?.aborted)).toBe(true);
+  });
+
+  test("abort while the handshake stalls rejects promptly and frees the queue", async () => {
+    const auth = setup();
+    await auth.connect(newClient());
+    const controller = new AbortController();
+    const stalled = auth.connect(newClient(), {
+      signal: controller.signal,
+      transportOptions: {
+        fetch: (url, init) =>
+          String(init?.body).includes("notifications/initialized")
+            ? new Promise((_, reject) =>
+                init!.signal!.addEventListener("abort", () =>
+                  reject(init!.signal!.reason),
+                ),
+              )
+            : fetch(url, init),
+      },
+    });
+    await sleep(100);
+    controller.abort(new Error("cancelled"));
+    await expect(stalled).rejects.toThrow("cancelled");
+    await auth.connect(newClient());
+  });
+
+  test("refuses to close a caller-owned transport", async () => {
+    const auth = setup();
+    const client = newClient();
+    const store = memory();
+    await setup({ store }).connect(newClient());
+    const authed = setup({ store });
+    const transport = new StreamableHTTPClientTransport(new URL(mock.mcpUrl), {
+      authProvider: authed,
+    });
+    await client.connect(transport);
+    await expect(auth.connect(client)).rejects.toThrow(/completeAuthorization/);
+    expect(client.transport).toBe(transport);
+    expect(await client.listTools()).toEqual({ tools: [] });
+  });
+
+  test("is a no-op for a client it already connected", async () => {
+    const auth = setup();
+    const client = newClient();
+    await auth.connect(client);
+    const first = client.transport;
+    await auth.connect(client);
+    expect(client.transport).toBe(first);
+    expect(await client.listTools()).toEqual({ tools: [] });
+  });
+
+  test("concurrent step-ups: every request can retry after connect()", async () => {
+    const auth = setup();
+    const client = newClient();
+    await auth.connect(client);
+    mock.knobs.requiredScope = "admin";
+    const retried = await Promise.all(
+      [0, 1, 2].map(async () => {
+        try {
+          return await client.listTools();
+        } catch (e) {
+          if (!(e instanceof UnauthorizedError)) throw e;
+          await auth.connect(client);
+          return client.listTools();
+        }
+      }),
+    );
+    expect(retried).toEqual([{ tools: [] }, { tools: [] }, { tools: [] }]);
+    expect(mock.authorizeRequests).toHaveLength(2);
+  });
+
+  test("a 403 step-up on the reconnect after authorizing completes in the same call", async () => {
+    mock.knobs.requiredScope = "admin"; // not advertised: the first flow can't request it
+    const auth = setup();
+    const client = newClient();
+    await auth.connect(client);
+    expect(await client.listTools()).toEqual({ tools: [] });
+    expect(mock.authorizeRequests).toHaveLength(2);
+  });
+
+  test("403 insufficient_scope step-up completes through connect()", async () => {
+    const auth = setup();
+    const client = newClient();
+    await auth.connect(client);
+    mock.knobs.requiredScope = "admin";
+    await expect(client.listTools()).rejects.toBeInstanceOf(UnauthorizedError);
+    await auth.connect(client);
+    expect(await client.listTools()).toEqual({ tools: [] });
+    expect(mock.authorizeRequests.at(-1)!.searchParams.get("scope")).toContain(
+      "admin",
+    );
+  });
+});
+
+describe("flow ownership", () => {
+  test("a second state() while a flow is active is rejected", async () => {
+    const auth = setup();
+    await auth.state!();
+    expect(() => auth.state!()).toThrow(/already in progress/);
+  });
+
+  test("a new flow can't start while an exchange is running", async () => {
+    mock.knobs.tokenDelay = 300;
+    const auth = setup();
+    const connecting = auth.connect(newClient());
+    while (mock.tokenRequests.length === 0) await sleep(10);
+    expect(() => auth.state!()).toThrow(/already in progress/);
+    await connecting;
+  });
+
+  test("a custom transport gets an external flow completed by completeAuthorization()", async () => {
+    const auth = setup();
+    const client = newClient();
+    const transport = new StreamableHTTPClientTransport(new URL(mock.mcpUrl), {
+      authProvider: auth,
+    });
+    await expect(client.connect(transport)).rejects.toBeInstanceOf(
+      UnauthorizedError,
+    );
+    // connect() can't complete a flow a caller's transport started: no "retry" signal.
+    const error = await auth.connect(newClient()).catch((e) => e);
+    expect(error).not.toBeInstanceOf(UnauthorizedError);
+    expect(error.message).toMatch(/already in progress/);
+    await auth.completeAuthorization(transport);
+    await transport.close();
+    const next = new StreamableHTTPClientTransport(new URL(mock.mcpUrl), {
+      authProvider: auth,
+    });
+    await client.connect(next);
+    expect(await client.listTools()).toEqual({ tools: [] });
+  });
+
+  test("completeAuthorization() refuses a connect()-owned flow; both stay usable", async () => {
+    const auth = setup();
+    const client = newClient();
+    await auth.connect(client);
+    mock.knobs.requiredScope = "admin";
+    await expect(client.listTools()).rejects.toBeInstanceOf(UnauthorizedError);
+    await expect(
+      auth.completeAuthorization(client.transport as never),
+    ).rejects.toThrow(/connect\(\)/);
+    await auth.connect(client);
+    expect(await client.listTools()).toEqual({ tools: [] });
+  });
+
+  test("completeAuthorization() reports a timeout that elapsed during the exchange", async () => {
+    const auth = setup({ timeout: 100 });
+    const transport = new StreamableHTTPClientTransport(new URL(mock.mcpUrl), {
+      authProvider: auth,
+    });
+    await expect(newClient().connect(transport)).rejects.toBeInstanceOf(
+      UnauthorizedError,
+    );
+    const error = await auth
+      .completeAuthorization({
+        finishAuth: (params) =>
+          sleep(200).then(() => transport.finishAuth(params)),
+      })
+      .catch((e) => e);
+    expect(error.name).toBe("TimeoutError");
+    expect(await auth.tokens()).toBeDefined(); // the exchange itself completed
+  });
+
+  test("an authorization URL with a duplicate client_id is refused", async () => {
+    const auth = setup();
+    await auth.saveClientInformation!({ client_id: "a", issuer: mock.base });
+    const url = new URL("https://as.example.com/authorize?response_type=code");
+    url.searchParams.set("redirect_uri", redirectUri);
+    url.searchParams.set("state", await auth.state!());
+    url.searchParams.append("client_id", "a");
+    url.searchParams.append("client_id", "b");
+    await expect(auth.redirectToAuthorization(url)).rejects.toThrow(
+      /client changed/,
+    );
+  });
+
+  const ownTransport = (auth: ReturnType<typeof setup>) =>
+    new StreamableHTTPClientTransport(new URL(mock.mcpUrl), {
+      authProvider: auth,
+    });
+
+  test("own transports: a refresh can't restore invalidated tokens after another attempt starts", async () => {
+    const store = memory();
+    await setup({ store }).connect(newClient());
+    const doc = JSON.parse(store.value!);
+    doc.tokens.access_token = "expired";
+    store.value = JSON.stringify(doc);
+    mock.knobs.tokenDelay = 300;
+    const auth = setup({ store, launch: () => {} });
+    const refreshing = newClient()
+      .connect(ownTransport(auth))
+      .catch((e) => e);
+    const before = mock.tokenRequests.length;
+    while (mock.tokenRequests.length === before) await sleep(10);
+    await auth.invalidateCredentials("tokens");
+    // A second attempt on the shared owner re-reads clientInformation() and starts a flow.
+    await expect(
+      newClient().connect(ownTransport(auth)),
+    ).rejects.toBeInstanceOf(UnauthorizedError);
+    await refreshing;
+    expect(await auth.tokens()).toBeUndefined();
+    expect(JSON.parse(store.value!).tokens).toBeUndefined();
+  });
+
+  test("a refresh landing while another flow awaits its callback can't restore tokens", async () => {
+    const store = memory();
+    await setup({ store }).connect(newClient());
+    const doc = JSON.parse(store.value!);
+    doc.tokens.access_token = "expired";
+    store.value = JSON.stringify(doc);
+    mock.knobs.tokenDelay = 300;
+    const auth = setup({ store, launch: () => {} });
+    const refreshing = auth.connect(newClient()).catch((e) => e);
+    const before = mock.tokenRequests.length;
+    while (mock.tokenRequests.length === before) await sleep(10);
+    await auth.invalidateCredentials("tokens");
+    const transport = ownTransport(auth);
+    await expect(newClient().connect(transport)).rejects.toBeInstanceOf(
+      UnauthorizedError,
+    );
+    const controller = new AbortController();
+    const waiting = auth
+      .completeAuthorization(transport, { signal: controller.signal })
+      .catch(() => {});
+    expectEnded(await refreshing, "tokens");
+    expect(await auth.tokens()).toBeUndefined();
+    controller.abort();
+    await waiting;
+  });
+
+  test("an aborted signal still consumes a pending flow on your own transport", async () => {
+    const auth = setup({ launch: () => {} });
+    await expect(
+      newClient().connect(ownTransport(auth)),
+    ).rejects.toBeInstanceOf(UnauthorizedError);
+    const reason = new Error("gone");
+    await expect(
+      auth.completeAuthorization(ownTransport(auth), {
+        signal: AbortSignal.abort(reason),
+      }),
+    ).rejects.toBe(reason);
+    await expect(
+      newClient().connect(ownTransport(auth)),
+    ).rejects.toBeInstanceOf(UnauthorizedError); // a new flow, not "already in progress"
+  });
+
+  test("own transports: another attempt's discovery can't reach a pending flow", async () => {
+    let launched!: (url: URL) => void;
+    const launch = new Promise<URL>((resolve) => (launched = resolve));
+    const auth = setup({ launch: (url) => launched(url) });
+    const transport = ownTransport(auth);
+    await expect(newClient().connect(transport)).rejects.toBeInstanceOf(
+      UnauthorizedError,
+    );
+    // What an overlapping pass on the shared owner saves before losing at state().
+    await auth.saveDiscoveryState!({
+      authorizationServerUrl: "https://other-as.example.com/",
+    });
+    await mock.authorize(await launch);
+    await auth.completeAuthorization(transport);
+    expect(await auth.tokens()).toBeDefined();
+  });
+
+  test("own transports: a failed flow stays pending until completeAuthorization() reports it", async () => {
+    const failure = new Error("no browser");
+    let fail = true;
+    const auth = setup({
+      launch: (url) => (fail ? Promise.reject(failure) : mock.authorize(url)),
+    });
+    const stale = ownTransport(auth);
+    await expect(newClient().connect(stale)).rejects.toBeInstanceOf(
+      UnauthorizedError,
+    );
+    await sleep(10); // the launcher has failed
+    fail = false;
+    const error = await newClient()
+      .connect(ownTransport(auth))
+      .catch((e) => e);
+    expect(error).not.toBeInstanceOf(UnauthorizedError);
+    expect(error.message).toMatch(/already in progress/);
+    await expect(auth.completeAuthorization(stale)).rejects.toBe(failure);
+    const fresh = ownTransport(auth);
+    await expect(newClient().connect(fresh)).rejects.toBeInstanceOf(
+      UnauthorizedError,
+    );
+    await auth.completeAuthorization(fresh);
+    expect(await auth.tokens()).toBeDefined();
+  });
+
+  test("completeAuthorization() without a pending flow throws", async () => {
+    const auth = setup();
+    await expect(
+      auth.completeAuthorization({ finishAuth: async () => {} }),
+    ).rejects.toThrow(/No MCP authorization/);
+  });
+
+  test("a second custom transport can't join a flow it didn't start", async () => {
+    let launched!: (url: URL) => void;
+    const launch = new Promise<URL>((resolve) => (launched = resolve));
+    const auth = setup({ launch: (url) => launched(url) });
+    const [a, b] = [0, 1].map(
+      () =>
+        new StreamableHTTPClientTransport(new URL(mock.mcpUrl), {
+          authProvider: auth,
+        }),
+    );
+    const first = newClient()
+      .connect(a!)
+      .catch((e) => e);
+    const url = await launch;
+    const error = await newClient()
+      .connect(b!)
+      .catch((e) => e);
+    expect(error).not.toBeInstanceOf(UnauthorizedError);
+    expect(error.message).toMatch(/already in progress/);
+    expect(await first).toBeInstanceOf(UnauthorizedError);
+    await mock.authorize(url);
+    await auth.completeAuthorization(a!);
+    const clientId = (await auth.clientInformation())!.client_id;
+    expect(mock.tokenRequests.at(-1)!.get("client_id")).toBe(clientId);
+  });
+});
+
+describe("credentials", () => {
+  test("a store for another serverUrl is rejected", async () => {
+    const store = memory();
+    store.value = JSON.stringify({
+      version: 1,
+      serverUrl: "https://other.example.com/mcp",
+    });
+    await expect(setup({ store }).connect(newClient())).rejects.toThrow(
+      /belong to/,
+    );
+  });
+
+  test("corrupt store text is an error, not a silent reset", async () => {
+    const store = memory();
+    store.value = "{not json";
+    await expect(setup({ store }).connect(newClient())).rejects.toThrow(
+      /not valid JSON/,
+    );
+    store.value = JSON.stringify({ version: 2, serverUrl: mock.mcpUrl });
+    await expect(setup({ store }).connect(newClient())).rejects.toThrow(
+      /unsupported format/,
+    );
+  });
+
+  test("a failed load is retried, not cached", async () => {
+    const store = memory();
+    const load = store.load;
+    store.load = async () => {
+      store.load = load;
+      throw new Error("keychain locked");
+    };
+    const auth = setup({ store });
+    await expect(auth.tokens()).rejects.toThrow(/keychain locked/);
+    await auth.connect(newClient());
+    expect(await auth.tokens()).toBeDefined();
+  });
+
+  test("a redirect URI change re-registers a DCR client", async () => {
+    const store = memory();
+    await setup({ store }).connect(newClient());
+    const doc = JSON.parse(store.value!);
+    delete doc.tokens; // re-registration happens when authorization is needed
+    store.value = JSON.stringify(doc);
+    const moved = setup({
+      store,
+      redirectUri: `http://127.0.0.1:${await freePort()}/callback`,
+    });
+    const client = newClient();
+    await moved.connect(client);
+    expect(mock.registrations).toHaveLength(2);
+    expect(JSON.parse(store.value!).client.client_id).toBe("client-2");
+  });
+
+  test("a registration the AS made for another redirect URI is refused, not saved", async () => {
+    const store = memory();
+    const auth = setup({ store });
+    await expect(
+      auth.saveClientInformation!({
+        client_id: "a",
+        issuer: mock.base,
+        redirect_uris: ["http://127.0.0.1:1/other"],
+      }),
+    ).rejects.toThrow(/without redirect URI/);
+    expect(store.value).toBeUndefined();
+  });
+
+  test("a registration without echoed redirect_uris still re-registers after a redirectUri change", async () => {
+    const store = memory();
+    await setup({ store }).saveClientInformation!({
+      client_id: "a",
+      issuer: mock.base,
+    });
+    const moved = setup({
+      store,
+      redirectUri: `http://127.0.0.1:${await freePort()}/callback`,
+    });
+    expect(await moved.clientInformation()).toBeUndefined();
+  });
+
+  for (const kind of ["dynamic", "static"])
+    test(`invalidateCredentials('all') during a token exchange wins (${kind} client)`, async () => {
+      mock.knobs.tokenDelay = 300;
+      const store = memory();
+      const auth = setup({
+        store,
+        ...(kind === "static" && {
+          clientName: undefined,
+          clientInformation: {
+            client_id: "static-client",
+            issuer: mock.base,
+          },
+        }),
+      });
+      const connecting = auth.connect(newClient()).catch((e) => e);
+      while (mock.tokenRequests.length === 0) await sleep(10);
+      await auth.invalidateCredentials("all");
+      expect((await connecting).message).toMatch(/invalidated/);
+      expect(store.value).toBeUndefined();
+      expect(await auth.tokens()).toBeUndefined();
+    });
+
+  const staticOptions = () => ({
+    clientName: undefined,
+    clientInformation: { client_id: "static-client", issuer: mock.base },
+  });
+
+  for (const [kind, scope] of [
+    ["dynamic", "tokens"],
+    ["static", "all"],
+  ] as const)
+    test(`invalidateCredentials('${scope}') during a refresh wins (${kind} client)`, async () => {
+      const store = memory();
+      const options = kind === "static" ? staticOptions() : {};
+      await setup({ store, ...options }).connect(newClient());
+      const doc = JSON.parse(store.value!);
+      doc.tokens.access_token = "expired";
+      store.value = JSON.stringify(doc);
+      mock.knobs.tokenDelay = 300;
+      const auth = setup({ store, ...options });
+      const connecting = auth.connect(newClient()).catch((e) => e);
+      const before = mock.tokenRequests.length;
+      while (mock.tokenRequests.length === before) await sleep(10);
+      await auth.invalidateCredentials(scope);
+      expectEnded(await connecting, scope);
+      expect(await auth.tokens()).toBeUndefined();
+      if (scope === "all") expect(store.value).toBeUndefined();
+    });
+
+  test("invalidation during an external exchange survives a re-stamping attempt", async () => {
+    const auth = setup();
+    const newTransport = () =>
+      new StreamableHTTPClientTransport(new URL(mock.mcpUrl), {
+        authProvider: auth,
+      });
+    const transport = newTransport();
+    await expect(newClient().connect(transport)).rejects.toBeInstanceOf(
+      UnauthorizedError,
+    );
+    mock.knobs.tokenDelay = 300;
+    const completing = auth.completeAuthorization(transport).catch((e) => e);
+    while (mock.tokenRequests.length === 0) await sleep(10);
+    await auth.invalidateCredentials("tokens");
+    await newClient()
+      .connect(newTransport())
+      .catch(() => {}); // re-stamps the shared owner
+    expectEnded(await completing, "tokens");
+    expect(await auth.tokens()).toBeUndefined();
+  });
+
+  test("invalidation aborts a live transport's refresh; re-authorization on it isn't overwritten", async () => {
+    const auth = setup();
+    const client = newClient();
+    await auth.connect(client);
+    mock.expireAccessTokens();
+    let release!: () => void;
+    mock.knobs.refreshGate = new Promise((resolve) => (release = resolve));
+    const before = mock.tokenRequests.length;
+    const refreshing = client.listTools().catch((e) => e);
+    while (mock.tokenRequests.length === before) await sleep(10);
+    await auth.invalidateCredentials("tokens");
+    // Settles while the refresh response is still held back: the request was aborted.
+    expectEnded(await refreshing, "tokens");
+    // Fresh authorization on the same transport, then let the stale response go.
+    await expect(client.listTools()).rejects.toBeInstanceOf(UnauthorizedError);
+    await auth.connect(client);
+    expect(mock.tokenRequests.at(-1)!.get("grant_type")).toBe(
+      "authorization_code",
+    );
+    release();
+    await sleep(20);
+    expect(await client.listTools()).toEqual({ tools: [] });
+  });
+
+  test("a refresh released during a step-up exchange on the same transport can't break it", async () => {
+    const store = memory();
+    const auth = setup({ store });
+    const client = newClient();
+    await auth.connect(client);
+    let release!: () => void;
+    mock.knobs.refreshGate = new Promise((resolve) => (release = resolve));
+    mock.knobs.rejectNext = true;
+    const before = mock.tokenRequests.length;
+    const refreshing = client.listTools().catch((e) => e);
+    while (mock.tokenRequests.length === before) await sleep(10);
+    mock.knobs.requiredScope = "admin";
+    await expect(client.listTools()).rejects.toBeInstanceOf(UnauthorizedError);
+    mock.knobs.tokenDelay = 100;
+    const stepUp = auth.connect(client);
+    while (
+      mock.tokenRequests.at(-1)!.get("grant_type") !== "authorization_code"
+    )
+      await sleep(5);
+    release(); // while the code exchange is pending
+    await stepUp;
+    await refreshing;
+    expect(JSON.parse(store.value!).tokens.scope).toContain("admin");
+    expect(await client.listTools()).toEqual({ tools: [] });
+  });
+
+  test("a newer step-up supersedes a slower refresh from another transport", async () => {
+    const store = memory();
+    const auth = setup({ store });
+    const [a, b] = [newClient(), newClient()];
+    await auth.connect(a);
+    await auth.connect(b);
+    let release!: () => void;
+    mock.knobs.refreshGate = new Promise((resolve) => (release = resolve));
+    mock.knobs.rejectNext = true;
+    const before = mock.tokenRequests.length;
+    const refreshing = a.listTools().catch((e) => e);
+    while (mock.tokenRequests.length === before) await sleep(10);
+    mock.knobs.requiredScope = "admin";
+    await expect(b.listTools()).rejects.toBeInstanceOf(UnauthorizedError);
+    await auth.connect(b); // step-up: tokens now carry "admin"
+    // The stale refresh is aborted and its request succeeds with the newer tokens.
+    expect(await refreshing).toEqual({ tools: [] });
+    release(); // where the stale refresh response would have landed
+    await sleep(20);
+    expect(JSON.parse(store.value!).tokens.scope).toContain("admin");
+    expect(await b.listTools()).toEqual({ tools: [] });
+    expect(mock.authorizeRequests).toHaveLength(2); // initial + step-up only
+  });
+
+  /** Two clients connected through one provider, then a step-up on `b` held at its code exchange. */
+  const stepUpHeldAtExchange = async () => {
+    const store = memory();
+    const auth = setup({ store });
+    const [a, b] = [newClient(), newClient()];
+    await auth.connect(a);
+    await auth.connect(b);
+    mock.knobs.requiredScope = "admin";
+    await expect(b.listTools()).rejects.toBeInstanceOf(UnauthorizedError);
+    let release!: () => void;
+    mock.knobs.exchangeGate = new Promise((resolve) => (release = resolve));
+    const exchangeAt = mock.tokenRequests.length + 1;
+    const stepUp = auth.connect(b);
+    while (mock.tokenRequests.length < exchangeAt) await sleep(5);
+    expect(mock.tokenRequests.at(-1)!.get("grant_type")).toBe(
+      "authorization_code",
+    );
+    const finish = async () => {
+      release();
+      await stepUp;
+      // No refresh reached the server once the exchange began.
+      expect(
+        mock.tokenRequests
+          .slice(exchangeAt)
+          .map((params) => params.get("grant_type")),
+      ).not.toContain("refresh_token");
+      expect(JSON.parse(store.value!).tokens.scope).toContain("admin");
+    };
+    return { auth, a, b, finish };
+  };
+
+  for (const same of [false, true])
+    test(`a refresh starting during a step-up exchange can't overwrite it (${same ? "same" : "another"} transport)`, async () => {
+      const { auth, a, b, finish } = await stepUpHeldAtExchange();
+      const client = same ? b : a;
+      mock.knobs.rejectNext = true;
+      // Superseded: the retry after connect() uses the newer tokens.
+      expect(await client.listTools().catch((e) => e)).toBeInstanceOf(
+        UnauthorizedError,
+      );
+      await finish();
+      await auth.connect(client);
+      expect(await client.listTools()).toEqual({ tools: [] });
+      expect(mock.authorizeRequests).toHaveLength(2); // initial + step-up only
+    });
+
+  test("during a step-up exchange, only the exchanging transport saves tokens", async () => {
+    const { auth, finish } = await stepUpHeldAtExchange();
+    // What a refresh from a caller-created transport would save.
+    await expect(
+      auth.saveTokens({ access_token: "late", token_type: "Bearer" }),
+    ).rejects.toBeInstanceOf(UnauthorizedError);
+    await finish();
+  });
+
+  test("invalidateCredentials('all') clears an unreadable store", async () => {
+    const store = memory();
+    store.value = "{not json";
+    const auth = setup({ store });
+    await expect(auth.tokens()).rejects.toThrow(/not valid JSON/);
+    await auth.invalidateCredentials("all");
+    expect(store.value).toBeUndefined();
+    const client = newClient();
+    await auth.connect(client);
+    expect(await client.listTools()).toEqual({ tools: [] });
+  });
+
+  for (const scope of ["client", "all"] as const)
+    test(`invalidateCredentials('${scope}') during a registration wins`, async () => {
+      mock.knobs.registerDelay = 300;
+      const store = memory();
+      const auth = setup({ store });
+      const connecting = auth.connect(newClient()).catch((e) => e);
+      while (mock.registrations.length === 0) await sleep(10);
+      await auth.invalidateCredentials(scope);
+      expectEnded(await connecting, scope);
+      expect(await auth.clientInformation()).toBeUndefined();
+      expect(store.value).toBeUndefined();
+    });
+
+  test("sign-out while a redirect is being set up never launches", async () => {
+    let launched = false;
+    const auth = setup({
+      store: authorized(),
+      launch: () => void (launched = true),
+    });
+    const state = await auth.state!();
+    await auth.saveCodeVerifier("verifier");
+    const url = new URL("https://as.example.com/authorize");
+    url.searchParams.set("client_id", "a");
+    url.searchParams.set("redirect_uri", redirectUri);
+    url.searchParams.set("state", state);
+    const redirect = auth.redirectToAuthorization(url);
+    await auth.invalidateCredentials("all");
+    await expect(redirect).rejects.toThrow(/invalidated/);
+    await sleep(50);
+    expect(launched).toBe(false);
+    await expect(fetch(redirectUri)).rejects.toThrow(); // no orphan listener
+  });
+
+  test("sign-out during discovery ends connect(), despite the SDK's fallback", async () => {
+    let launched = false;
+    const store = memory();
+    const auth = setup({ store, launch: () => void (launched = true) });
+    let signedOut = false;
+    const connecting = auth.connect(newClient(), {
+      transportOptions: {
+        fetch: async (url, init) => {
+          if (String(url).includes("oauth-protected-resource") && !signedOut) {
+            signedOut = true;
+            await auth.invalidateCredentials("all");
+            init?.signal?.throwIfAborted(); // the SDK swallows this and falls back
+          }
+          return fetch(url, init);
+        },
+      },
+    });
+    await expect(connecting).rejects.toThrow(/invalidated/);
+    expect(signedOut).toBe(true);
+    expect(launched).toBe(false);
+    expect(store.value).toBeUndefined();
+  });
+
+  test("sign-out ends a connect() waiting for the browser", async () => {
+    let respond = false;
+    const auth = setup({
+      launch: (url) => void (respond && mock.authorize(url)),
+    });
+    const connecting = auth.connect(newClient());
+    await sleep(100);
+    const started = Date.now();
+    await auth.invalidateCredentials("all");
+    await expect(connecting).rejects.toThrow(/invalidated/);
+    expect(Date.now() - started).toBeLessThan(1000);
+    await expect(fetch(redirectUri)).rejects.toThrow();
+    respond = true;
+    await auth.connect(newClient());
+  });
+
+  test("invalidateCredentials('all') clears the store", async () => {
+    const store = memory();
+    const auth = setup({ store });
+    await auth.connect(newClient());
+    await auth.invalidateCredentials("all");
+    expect(store.value).toBeUndefined();
+  });
+
+  test("a client registration still being persisted blocks new flows", async () => {
+    let release!: () => void;
+    const store: CredentialStore = {
+      load: async () => undefined,
+      save: () => new Promise<void>((resolve) => (release = resolve)),
+    };
+    const auth = setup({ store });
+    await auth.tokens(); // load the slot
+    const saving = auth.saveClientInformation!({
+      client_id: "a",
+      issuer: "https://as",
+    });
+    await sleep(0);
+    expect(() => auth.state!()).toThrow(/already in progress/);
+    release();
+    await saving;
+    expect(await auth.state!()).toBeString();
+  });
+
+  test("a refresh can't save once the tokens it replaces were invalidated", async () => {
+    const auth = setup({ store: authorized() });
+    await auth.invalidateCredentials("tokens");
+    await expect(
+      auth.saveTokens({ access_token: "late", token_type: "Bearer" }),
+    ).rejects.toThrow(/invalidated/);
+    expect(await auth.tokens()).toBeUndefined();
+  });
+
+  test("concurrent client and token saves both persist", async () => {
+    const store = authorized();
+    const auth = setup({ store });
+    await Promise.all([
+      auth.saveClientInformation!({ client_id: "a", issuer: "https://as" }),
+      auth.saveTokens({
+        access_token: "t",
+        token_type: "Bearer",
+        issuer: "https://as",
+      }),
+    ]);
+    expect(JSON.parse(store.value!)).toMatchObject({
+      client: { client_id: "a" },
+      tokens: { access_token: "t" },
+    });
+  });
+
+  test("a new registration replaces the slot and drops the old client's tokens", async () => {
+    const auth = setup({ store: authorized() });
+    expect(await auth.tokens()).toBeDefined();
+    await auth.saveClientInformation!({
+      client_id: "b",
+      issuer: "https://as2",
+    });
+    expect(await auth.clientInformation()).toEqual({
+      redirect_uris: [redirectUri],
+      client_id: "b",
+      issuer: "https://as2",
+    });
+    expect(await auth.tokens()).toBeUndefined();
+  });
+});
+
+describe("static client", () => {
+  const staticClient = (issuer: string) => ({
+    client_id: "static-client",
+    redirect_uris: ["http://127.0.0.1:1/other"],
+    issuer,
+  });
+
+  test("is used verbatim, never re-registered, even with other redirect_uris", async () => {
+    const auth = setup({
+      clientName: undefined,
+      clientInformation: staticClient(mock.base),
+    });
+    expect(auth.saveClientInformation).toBeUndefined();
+    await auth.connect(newClient());
+    expect(mock.registrations).toHaveLength(0);
+    expect(mock.authorizeRequests[0]!.searchParams.get("client_id")).toBe(
+      "static-client",
+    );
+  });
+
+  test("a foreign issuer fails with AuthorizationServerMismatchError, no DCR", async () => {
+    const auth = setup({
+      clientInformation: staticClient("https://other-as.example.com"),
+    });
+    const error = await auth.connect(newClient()).catch((e) => e);
+    expect(error).toBeInstanceOf(AuthorizationServerMismatchError);
+    expect(mock.registrations).toHaveLength(0);
+  });
+
+  test("stored tokens are never handed to a different static client", async () => {
+    const store = memory();
+    await setup({ store, clientInformation: staticClient(mock.base) }).connect(
+      newClient(),
+    );
+    const other = setup({
+      store,
+      clientInformation: { ...staticClient(mock.base), client_id: "other" },
+    });
+    expect(await other.tokens()).toBeUndefined();
+  });
+
+  test("survives invalidateCredentials('all')", async () => {
+    const auth = setup({ clientInformation: staticClient(mock.base) });
+    await auth.invalidateCredentials("all");
+    expect(await auth.clientInformation()).toMatchObject({
+      client_id: "static-client",
+    });
+  });
+});
+
+describe("options", () => {
+  test("are validated up front", () => {
+    const valid = {
+      serverUrl: "https://mcp.example.com/mcp",
+      redirectUri: "http://127.0.0.1:8765/cb",
+      clientName: "x",
+    };
+    expect(() => browserAuth(valid)).not.toThrow();
+    for (const invalid of [
+      { ...valid, serverUrl: "ftp://x" },
+      { ...valid, serverUrl: "http://mcp.example.com/mcp" },
+      { ...valid, serverUrl: "https://u:p@mcp.example.com/mcp" },
+      { ...valid, serverUrl: "https://mcp.example.com/mcp#x" },
+      { ...valid, redirectUri: undefined },
+      { ...valid, redirectUri: "http://127.0.0.1:0/cb" },
+      { ...valid, redirectUri: "https://127.0.0.1:1/cb" },
+      { ...valid, clientName: undefined },
+      {
+        ...valid,
+        clientName: undefined,
+        clientInformation: { client_id: "x" },
+      },
+      {
+        ...valid,
+        clientName: undefined,
+        clientInformation: { client_id: "", issuer: "https://as" },
+      },
+      { ...valid, successHtml: 1 },
+      { ...valid, clientName: 1 },
+      { ...valid, errorHtml: {} },
+      { ...valid, timeout: 0 },
+      { ...valid, launch: true },
+      { ...valid, store: {} },
+      { ...valid, clientMetadata: "read" },
+      { ...valid, clientMetadata: ["read"] },
+      { ...valid, clientMetadata: null },
+    ])
+      expect(() => browserAuth(invalid as never)).toThrow();
+    expect(() =>
+      browserAuth({
+        ...valid,
+        clientName: undefined,
+        clientInformation: { client_id: "x" } as never,
+      }),
+    ).toThrow(/authorization_servers/);
+    expect(() =>
+      browserAuth({
+        ...valid,
+        clientInformation: { client_id: "x", issuer: "https://as" },
+      }),
+    ).toThrow(/not both/);
+  });
+});
+
+describe("fileStore()", () => {
+  let dir: string;
+  beforeEach(
+    async () => (dir = await mkdtemp(join(tmpdir(), "oauth-callback-"))),
+  );
+  afterEach(() => rm(dir, { recursive: true, force: true }));
+
+  test("round-trips text byte for byte with private permissions", async () => {
+    const path = join(dir, "nested/dir/credentials.json");
+    const store = fileStore(path);
+    expect(await store.load()).toBeUndefined();
+    const text = '{"ünïcødé":"✓"}\n  ';
+    await store.save(text);
+    expect(await store.load()).toBe(text);
+    if (process.platform !== "win32") {
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      expect((await stat(join(dir, "nested/dir"))).mode & 0o777).toBe(0o700);
+    }
+    await store.save(undefined);
+    expect(await store.load()).toBeUndefined();
+  });
+
+  test("keeps the last of concurrent writes", async () => {
+    const path = join(dir, "c.json");
+    const store = fileStore(path);
+    await Promise.all(["1", "2", "3"].map((v) => store.save(v)));
+    expect(await readFile(path, "utf8")).toBe("3");
+  });
+
+  test("requires an absolute path", () => {
+    for (const path of ["~/x.json", "x.json", "./x.json", ""])
+      expect(() => fileStore(path)).toThrow(TypeError);
+  });
+
+  test("works as a browserAuth store across instances", async () => {
+    const path = join(dir, "mcp.json");
+    await setup({ store: fileStore(path) }).connect(newClient());
+    await setup({
+      store: fileStore(path),
+      launch: () => Promise.reject(new Error("browser")),
+    }).connect(newClient());
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+      version: 1,
+      serverUrl: mock.mcpUrl,
+    });
+    await writeFile(path, "garbage");
+    await expect(
+      setup({ store: fileStore(path) }).connect(newClient()),
+    ).rejects.toThrow(/JSON/);
+  });
+});
