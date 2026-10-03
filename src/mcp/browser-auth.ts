@@ -181,6 +181,15 @@ interface Config {
 const INVALIDATED = "Credentials were invalidated during authorization";
 const SUPERSEDED = "The MCP credentials changed during authorization";
 
+/** Match the MCP SDK's issuer comparison: exact, or one trailing-slash difference. */
+const sameIssuer = (a: unknown, b: unknown): boolean =>
+  a === b ||
+  (typeof a === "string" &&
+    typeof b === "string" &&
+    (a.endsWith("/")
+      ? a.slice(0, -1) === b
+      : b.endsWith("/") && b.slice(0, -1) === a));
+
 /**
  * Shared state behind the provider and the per-transport views `connect()` creates.
  * Rule: one interactive authorization per provider at a time; overlapping attempts fail
@@ -510,7 +519,12 @@ class Session {
     if (!tokens) return undefined;
     const { client_id, ...rest } = tokens;
     const client = await this.#clientInformation();
-    return client?.client_id === client_id ? rest : undefined;
+    return client?.client_id === client_id &&
+      (tokens.issuer === undefined ||
+        client.issuer === undefined ||
+        sameIssuer(tokens.issuer, client.issuer))
+      ? rest
+      : undefined;
   }
 
   async #saveClient(
@@ -547,7 +561,7 @@ class Session {
         client: { redirect_uris: [this.config.redirect.href], ...client },
         tokens:
           tokens?.client_id === client.client_id &&
-          tokens.issuer === client.issuer
+          sameIssuer(tokens.issuer, client.issuer)
             ? tokens
             : undefined,
       }));

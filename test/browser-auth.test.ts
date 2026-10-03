@@ -1175,6 +1175,18 @@ describe("credentials", () => {
     });
     expect(await auth.tokens()).toBeUndefined();
   });
+
+  test("a trailing slash in the registered issuer keeps the same client's tokens", async () => {
+    const auth = setup({ store: authorized() });
+    await auth.saveClientInformation!({
+      client_id: "a",
+      issuer: "https://as/",
+    });
+    expect(await auth.tokens()).toMatchObject({
+      access_token: "old",
+      issuer: "https://as",
+    });
+  });
 });
 
 describe("static client", () => {
@@ -1216,6 +1228,40 @@ describe("static client", () => {
       clientInformation: { ...staticClient(mock.base), client_id: "other" },
     });
     expect(await other.tokens()).toBeUndefined();
+  });
+
+  test("stored tokens are not handed to the same client ID at a different issuer", async () => {
+    const store = authorized();
+    const otherIssuer = setup({
+      store,
+      clientInformation: { client_id: "a", issuer: "https://other-as" },
+    });
+    expect(await otherIssuer.tokens()).toBeUndefined();
+  });
+
+  test("stored tokens are reused when issuer values differ only by a trailing slash", async () => {
+    const store = authorized();
+    const sameIssuer = setup({
+      store,
+      clientInformation: { client_id: "a", issuer: "https://as/" },
+    });
+    expect(await sameIssuer.tokens()).toMatchObject({
+      access_token: "old",
+      issuer: "https://as",
+    });
+  });
+
+  test("legacy unstamped tokens remain available to the matching static client", async () => {
+    const store = authorized();
+    const document = JSON.parse(store.value!);
+    delete document.tokens.issuer;
+    store.value = JSON.stringify(document);
+
+    const sameClient = setup({
+      store,
+      clientInformation: { client_id: "a", issuer: "https://other-as" },
+    });
+    expect(await sameClient.tokens()).toMatchObject({ access_token: "old" });
   });
 
   test("survives invalidateCredentials('all')", async () => {
