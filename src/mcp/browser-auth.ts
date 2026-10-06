@@ -42,6 +42,7 @@ import {
 import {
   CredentialSlot,
   memoryStore,
+  ownsTokens,
   type CredentialStore,
 } from "./credential-store.js";
 
@@ -180,15 +181,6 @@ interface Config {
 
 const INVALIDATED = "Credentials were invalidated during authorization";
 const SUPERSEDED = "The MCP credentials changed during authorization";
-
-/** Match the MCP SDK's issuer comparison: exact, or one trailing-slash difference. */
-const sameIssuer = (a: unknown, b: unknown): boolean =>
-  a === b ||
-  (typeof a === "string" &&
-    typeof b === "string" &&
-    (a.endsWith("/")
-      ? a.slice(0, -1) === b
-      : b.endsWith("/") && b.slice(0, -1) === a));
 
 /**
  * Shared state behind the provider and the per-transport views `connect()` creates.
@@ -513,18 +505,13 @@ class Session {
     return client;
   }
 
-  /** Stored tokens, only for the client they were issued to (e.g. not after a static client change). */
+  /** Stored tokens, only for the client that obtained them (e.g. not after a static client or issuer change). */
   async #tokens(): Promise<StoredOAuthTokens | undefined> {
     const { tokens } = await this.credentials.read();
     if (!tokens) return undefined;
     const { client_id, ...rest } = tokens;
     const client = await this.#clientInformation();
-    return client?.client_id === client_id &&
-      (tokens.issuer === undefined ||
-        client.issuer === undefined ||
-        sameIssuer(tokens.issuer, client.issuer))
-      ? rest
-      : undefined;
+    return client && ownsTokens(client, tokens) ? rest : undefined;
   }
 
   async #saveClient(
@@ -555,15 +542,11 @@ class Session {
       );
     this.#savingClient++;
     try {
-      // Tokens belong to the client (and issuer) that obtained them. redirect_uris records
-      // what was registered even if the AS didn't echo it, so a changed redirectUri re-registers.
+      // redirect_uris records what was registered even if the AS didn't echo it, so a
+      // changed redirectUri re-registers.
       await this.credentials.update(({ tokens }) => ({
         client: { redirect_uris: [this.config.redirect.href], ...client },
-        tokens:
-          tokens?.client_id === client.client_id &&
-          sameIssuer(tokens.issuer, client.issuer)
-            ? tokens
-            : undefined,
+        tokens: tokens && ownsTokens(client, tokens) ? tokens : undefined,
       }));
     } finally {
       this.#savingClient--;
