@@ -505,7 +505,7 @@ class Session {
     return client;
   }
 
-  /** Stored tokens, only for the client that obtained them (e.g. not after a static client or issuer change). */
+  /** Stored tokens, if the current client owns them ({@link ownsTokens}). */
   async #tokens(): Promise<StoredOAuthTokens | undefined> {
     const { tokens } = await this.credentials.read();
     if (!tokens) return undefined;

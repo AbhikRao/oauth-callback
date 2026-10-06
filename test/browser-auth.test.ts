@@ -1233,7 +1233,7 @@ describe("static client", () => {
     expect(await other.tokens()).toBeUndefined();
   });
 
-  // Same pairs as the SDK's issuersMatch(): one trailing "/" apart, in either direction.
+  // As the SDK's issuersMatch(): equal up to one trailing "/", in either direction.
   test.each([
     ["https://as", "https://as", true],
     ["https://as", "https://as/", true],

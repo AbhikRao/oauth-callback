@@ -28,10 +28,10 @@ export interface CredentialStore {
 export type BoundTokens = StoredOAuthTokens & { client_id: string };
 
 /**
- * Whether `client` obtained `tokens`: same `client_id` and authorization server. The SDK
- * reads `tokens()` per request without an issuer, so this check is the adapter's.
- * Issuers compare as in the SDK's `issuersMatch()` (one trailing "/" apart still match);
- * an unstamped side matches any, as the SDK stamps it on its next write.
+ * Whether `client` obtained `tokens`: same `client_id` and issuer. The SDK's per-request
+ * `tokens()` read carries no issuer, so the adapter checks it. Issuers match as in the
+ * SDK's `issuersMatch()` (equal up to one trailing "/"); an unstamped side matches, as
+ * the SDK stamps it on its next write.
  */
 export function ownsTokens(
   client: StoredOAuthClientInformation,
