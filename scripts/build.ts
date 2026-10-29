@@ -9,7 +9,8 @@
  */
 
 import { $ } from "bun";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 export async function bundle(outdir: string) {
   const result = await Bun.build({
@@ -22,11 +23,15 @@ export async function bundle(outdir: string) {
     naming: { chunk: "chunks/[name]-[hash].[ext]" },
   });
   if (!result.success) throw new AggregateError(result.logs, "Build failed");
+  // `open` resolves its Linux fallback relative to its bundled launcher chunk.
+  const xdgOpen = join(outdir, "chunks/xdg-open");
+  await copyFile("node_modules/open/xdg-open", xdgOpen);
+  await chmod(xdgOpen, 0o755);
   return result.outputs;
 }
 
 /**
- * License texts of the packages bundled into `outputs` (MIT requires shipping the notice).
+ * License texts of bundled packages and the copied script (MIT requires shipping the notice).
  * Bun marks each inlined module with a `// node_modules/<package>/...` comment.
  */
 export async function thirdPartyNotices(outputs: { path: string }[]) {
@@ -42,7 +47,14 @@ export async function thirdPartyNotices(outputs: { path: string }[]) {
       return `## ${name}\n\n${license.trim()}\n`;
     }),
   );
-  return `# Third-party licenses\n\nBundled into the default browser launcher chunk.\n\n${notices.join("\n")}`;
+  // xdg-open's own copyright and MIT notice are in its initial comment block.
+  const xdgLicense = (await readFile("node_modules/open/xdg-open", "utf8"))
+    .split("\n\n")[0]!
+    .replace(/^#!.*\n/, "")
+    .replace(/^#\s{0,3}/gm, "")
+    .trim();
+  notices.push(`## xdg-utils (xdg-open)\n\n${xdgLicense}\n`);
+  return `# Third-party licenses\n\nBundled into the default browser launcher chunk or shipped alongside it.\n\n${notices.join("\n")}`;
 }
 
 if (import.meta.main) {

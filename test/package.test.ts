@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: MIT */
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import pkg from "../package.json";
@@ -45,6 +45,28 @@ test("MCP entry keeps the SDK external", async () => {
   expect(code).toContain('from "@modelcontextprotocol/client"');
 });
 
+test("bundled launcher ships its executable xdg-open fallback", async () => {
+  const chunks = await Array.fromAsync(
+    new Bun.Glob("chunks/*.js").scan({ cwd: outdir, absolute: true }),
+  );
+  const launcher = (
+    await Promise.all(
+      chunks.map(async (path) => ({
+        path,
+        code: await readFile(path, "utf8"),
+      })),
+    )
+  ).find(({ code }) => code.includes("// node_modules/open/index.js"));
+  expect(launcher).toBeDefined();
+  const fallback = join(dirname(launcher!.path), "xdg-open");
+  expect(await readFile(fallback, "utf8")).toBe(
+    await readFile("node_modules/open/xdg-open", "utf8"),
+  );
+  // Windows doesn't expose POSIX executable bits; the script ships for Linux.
+  if (process.platform !== "win32")
+    expect((await stat(fallback)).mode & 0o111).toBe(0o111);
+});
+
 test("bundled packages ship their license notices", async () => {
   const outputs = await Array.fromAsync(
     new Bun.Glob("**/*.js").scan({ cwd: outdir, absolute: true }),
@@ -52,6 +74,11 @@ test("bundled packages ship their license notices", async () => {
   const notices = await thirdPartyNotices(outputs.map((path) => ({ path })));
   expect(notices).toContain("## open\n");
   expect(notices).toContain("Sindre Sorhus");
+  expect(notices).toContain("## xdg-utils (xdg-open)\n");
+  expect(notices).toContain("Fathi Boudra");
+  expect(notices).toContain("Rex Dieter");
+  expect(notices).toContain("Kevin Krammer");
+  expect(notices).toContain("Jeremy White");
 });
 
 test("zero runtime dependencies", () => {
