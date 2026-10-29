@@ -248,9 +248,21 @@ class Session {
         return config.metadata;
       },
       state: () => this.#reserve(owner),
-      clientInformation: () => {
+      clientInformation: async () => {
         owner.generation = this.#generation;
-        return this.#clientInformation();
+        const client = await this.#clientInformation();
+        const expiresAt = client?.client_secret_expires_at;
+        // Only the SDK's auth path sees expiry: access tokens remain usable,
+        // and a pending code still belongs to its client until exchange settles.
+        if (
+          !config.staticClient &&
+          !this.#active() &&
+          typeof expiresAt === "number" &&
+          expiresAt > 0 &&
+          expiresAt <= Date.now() / 1000
+        )
+          return undefined;
+        return client;
       },
       tokens: () => this.#tokens(),
       saveTokens: async (tokens) => {

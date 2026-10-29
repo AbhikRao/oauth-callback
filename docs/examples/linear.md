@@ -137,6 +137,8 @@ Each authorization is also bounded by `timeout` (5 minutes by default).
 
 **Stale credentials.** `await client.close()`, then `await auth.invalidateCredentials("all")` to clear the store; the next `connect()` authorizes again.
 
+**Expired DCR client secret.** A stored registration with an elapsed `client_secret_expires_at` is replaced before a new browser authorization; valid access tokens remain usable. If the authorization server rejects a secret that expires during consent, retry the flow. Pre-registered `clientInformation` is never replaced automatically.
+
 ## Related
 
 - [browserAuth](/api/browser-auth)
