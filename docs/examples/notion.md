@@ -120,7 +120,7 @@ const auth = browserAuth({
 
 **Browser doesn't open.** Pass a `launch` that prints the URL, and open it on the same machine.
 
-**Expired DCR client secret.** A stored registration with an elapsed `client_secret_expires_at` is replaced before a new browser authorization; valid access tokens remain usable. If the authorization server rejects a secret that expires during consent, retry the flow. Pre-registered `clientInformation` is never replaced automatically.
+**`Existing OAuth client information is required when exchanging an authorization code`.** The authorization server rejected the client (`invalid_client`), e.g. its secret expired during consent: retry, and `browserAuth()` replaces the client first. A pre-registered `clientInformation` fails with `invalid_client` instead: renew its secret. See [browserAuth](/api/browser-auth#options).
 
 ## Security
 

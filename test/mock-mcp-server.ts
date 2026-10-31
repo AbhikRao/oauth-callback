@@ -45,10 +45,10 @@ export async function startMockServer(options: MockOptions = {}) {
     { secret: string; expiresAt: number }
   >();
   const knobs = {
-    /** Issue confidential DCR clients with this expiry; undefined keeps public clients. */
+    /** Issue confidential DCR clients with this secret expiry; undefined issues public clients. */
     clientSecretExpiresAt: undefined as number | undefined,
-    /** Seconds the AS still accepts a secret after its advertised expiry. */
-    clientSecretGracePeriod: 0,
+    /** How long the AS still accepts a secret after its advertised expiry. */
+    clientSecretGraceSeconds: 0,
     /** Scope the MCP endpoint requires (403 insufficient_scope otherwise). */
     requiredScope: undefined as string | undefined,
     /** Delay token responses (ms), e.g. to test cancellation. */
@@ -128,10 +128,11 @@ export async function startMockServer(options: MockOptions = {}) {
     if (path === "/register" && req.method === "POST") {
       const body = JSON.parse(await readBody(req));
       registrations.push(body);
+      // Assigned before the delay, so concurrent registrations get distinct IDs.
+      const client_id = `client-${registrations.length}`;
       if (knobs.registerDelay)
         await new Promise((r) => setTimeout(r, knobs.registerDelay));
       if (res.destroyed) return;
-      const client_id = `client-${registrations.length}`;
       const expiresAt = knobs.clientSecretExpiresAt;
       const secret = expiresAt === undefined ? undefined : randomUUID();
       if (secret !== undefined)
@@ -161,8 +162,8 @@ export async function startMockServer(options: MockOptions = {}) {
       if (
         client &&
         (params.get("client_secret") !== client.secret ||
-          (client.expiresAt > 0 &&
-            client.expiresAt + knobs.clientSecretGracePeriod <=
+          (client.expiresAt !== 0 &&
+            client.expiresAt + knobs.clientSecretGraceSeconds <=
               Date.now() / 1000))
       )
         return json(res, 400, { error: "invalid_client" });

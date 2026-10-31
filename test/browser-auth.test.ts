@@ -1194,21 +1194,22 @@ describe("credentials", () => {
 
 describe("DCR client secret expiry", () => {
   let now: number;
-  let restoreClock: () => void;
+  let clock: ReturnType<typeof spyOn>;
 
   beforeEach(() => {
     now = Math.floor(Date.now() / 1000) * 1000;
-    const clock = spyOn(Date, "now").mockImplementation(() => now);
-    restoreClock = () => clock.mockRestore();
+    clock = spyOn(Date, "now").mockImplementation(() => now);
     mock.knobs.clientSecretExpiresAt = now / 1000 + 60;
   });
 
-  afterEach(() => restoreClock());
+  afterEach(() => clock.mockRestore());
 
   for (const elapsed of [60, 61])
     test(`re-registers before opening the browser when the secret expired after ${elapsed}s`, async () => {
       const store = memory();
-      await setup({ store }).connect(newClient());
+      const first = newClient();
+      await setup({ store }).connect(first);
+      await first.close(); // Its background SSE stream would re-authorize concurrently.
       const doc = JSON.parse(store.value!);
       delete doc.tokens; // No refresh path: the next request needs the browser.
       store.value = JSON.stringify(doc);
@@ -1253,13 +1254,55 @@ describe("DCR client secret expiry", () => {
     expect(store.value).toBe(saved);
   });
 
+  test("re-registers instead of refreshing with an expired secret", async () => {
+    const store = memory();
+    const first = newClient();
+    await setup({ store }).connect(first);
+    await first.close(); // Its background SSE stream would re-authorize concurrently.
+    expect(JSON.parse(store.value!).tokens.refresh_token).toBeDefined();
+    mock.expireAccessTokens();
+    now += 60_000;
+    mock.knobs.clientSecretExpiresAt = now / 1000 + 60;
+
+    const client = newClient();
+    await setup({ store }).connect(client);
+    expect(await client.listTools()).toEqual({ tools: [] });
+    expect(mock.registrations).toHaveLength(2);
+    // No refresh doomed to invalid_client.
+    expect(mock.tokenRequests.map((p) => p.get("grant_type"))).toEqual([
+      "authorization_code",
+      "authorization_code",
+    ]);
+    expect(JSON.parse(store.value!).tokens.client_id).toBe("client-2");
+  });
+
+  test("switches an expired DCR client to CIMD where the AS now supports it", async () => {
+    const clientMetadataUrl = "https://app.example.com/oauth/client.json";
+    const store = memory();
+    const first = newClient();
+    await setup({ store, clientMetadataUrl }).connect(first);
+    await first.close(); // Its background SSE stream would re-authorize concurrently.
+    const doc = JSON.parse(store.value!);
+    delete doc.tokens;
+    store.value = JSON.stringify(doc);
+    now += 60_000;
+    mock.knobs.cimdSupported = true;
+
+    const auth = setup({ store, clientMetadataUrl });
+    await auth.connect(newClient());
+    expect(mock.registrations).toHaveLength(1);
+    expect(mock.tokenRequests.at(-1)!.get("client_id")).toBe(clientMetadataUrl);
+    expect(await auth.clientInformation()).toMatchObject({
+      client_id: clientMetadataUrl,
+    });
+  });
+
   test("re-registers an expired client for step-up even with a refresh token", async () => {
     const auth = setup();
     const first = newClient();
     await auth.connect(first);
     expect((await auth.tokens())!.refresh_token).toBeDefined();
-    // A later connection encounters a new scope requirement. Closing the first
-    // also ends its background SSE attempt, keeping authorization serialized.
+    // A live client's background SSE stream would step up concurrently (and register too).
     await first.close();
     now += 60_000;
     mock.knobs.clientSecretExpiresAt = now / 1000 + 60;
@@ -1282,7 +1325,7 @@ describe("DCR client secret expiry", () => {
     test(`keeps the pinned client when its secret expires during a pending ${kind} flow`, async () => {
       // The AS grants pending authorizations a grace period. Expiry must not
       // discard the client locally while its code still belongs to that client.
-      mock.knobs.clientSecretGracePeriod = 60;
+      mock.knobs.clientSecretGraceSeconds = 60;
       const launched = Promise.withResolvers<URL>();
       const auth = setup({ launch: (url) => void launched.resolve(url) });
       const client = newClient();
@@ -1329,6 +1372,32 @@ describe("DCR client secret expiry", () => {
       }
     });
 
+  test("a retry re-registers after the AS rejects a secret that expired during consent", async () => {
+    let launches = 0;
+    const auth = setup({
+      launch: (url) => {
+        if (!launches++) {
+          now += 60_000; // The user approves after the secret expired.
+          mock.knobs.clientSecretExpiresAt = now / 1000 + 60;
+        }
+        return mock.authorize(url);
+      },
+    });
+    // invalid_client: the SDK drops the client but can't exchange the code without it.
+    // The troubleshooting docs quote this SDK message.
+    await expect(auth.connect(newClient())).rejects.toThrow(
+      "Existing OAuth client information is required",
+    );
+    expect(mock.tokenRequests.at(-1)!.get("client_id")).toBe("client-1");
+
+    const client = newClient();
+    await auth.connect(client);
+    expect(await client.listTools()).toEqual({ tools: [] });
+    expect(mock.registrations).toHaveLength(2);
+    expect(mock.authorizeRequests).toHaveLength(2);
+    expect(mock.tokenRequests.at(-1)!.get("client_id")).toBe("client-2");
+  });
+
   for (const expiry of [undefined, 0, "future"] as const)
     test(`keeps a stored client with ${expiry ?? "missing"} secret expiry`, async () => {
       const auth = setup();
@@ -1343,6 +1412,17 @@ describe("DCR client secret expiry", () => {
       expect(await auth.clientInformation()).toMatchObject(client);
     });
 
+  test("treats a negative secret expiry as expired (only 0 means never)", async () => {
+    const auth = setup();
+    await auth.saveClientInformation!({
+      client_id: "a",
+      issuer: mock.base,
+      client_secret: "secret",
+      client_secret_expires_at: -1,
+    });
+    expect(await auth.clientInformation()).toBeUndefined();
+  });
+
   test("leaves an expired static client alone", async () => {
     const clientInformation = {
       client_id: "static-client",
@@ -1351,6 +1431,7 @@ describe("DCR client secret expiry", () => {
       client_secret_expires_at: now / 1000 - 1,
       token_endpoint_auth_method: "client_secret_post" as const,
     };
+    // The mock AS doesn't check static secrets: this proves no DCR, not that an expired one works.
     const auth = setup({ clientInformation });
     expect(await auth.clientInformation()).toEqual(clientInformation);
     const client = newClient();
@@ -1502,7 +1583,7 @@ describe("client ID metadata document", () => {
     });
   });
 
-  test("never replaces a stored client: the SDK prefers it to CIMD", async () => {
+  test("keeps a stored client: the SDK prefers it to CIMD", async () => {
     const store = memory();
     await setup({ store }).connect(newClient());
     mock.knobs.cimdSupported = true;
