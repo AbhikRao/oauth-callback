@@ -59,12 +59,13 @@ test("bundled launcher ships its executable xdg-open fallback", async () => {
   ).find(({ code }) => code.includes("// node_modules/open/index.js"));
   expect(launcher).toBeDefined();
   const fallback = join(dirname(launcher!.path), "xdg-open");
-  expect(await readFile(fallback, "utf8")).toBe(
-    await readFile("node_modules/open/xdg-open", "utf8"),
+  // Unmodified, so it keeps its own copyright and MIT notice.
+  expect(await readFile(fallback)).toEqual(
+    await readFile("node_modules/open/xdg-open"),
   );
-  // Windows doesn't expose POSIX executable bits; the script ships for Linux.
+  // Windows doesn't expose POSIX modes; the script ships for Linux.
   if (process.platform !== "win32")
-    expect((await stat(fallback)).mode & 0o111).toBe(0o111);
+    expect((await stat(fallback)).mode & 0o777).toBe(0o755);
 });
 
 test("bundled packages ship their license notices", async () => {
@@ -74,11 +75,6 @@ test("bundled packages ship their license notices", async () => {
   const notices = await thirdPartyNotices(outputs.map((path) => ({ path })));
   expect(notices).toContain("## open\n");
   expect(notices).toContain("Sindre Sorhus");
-  expect(notices).toContain("## xdg-utils (xdg-open)\n");
-  expect(notices).toContain("Fathi Boudra");
-  expect(notices).toContain("Rex Dieter");
-  expect(notices).toContain("Kevin Krammer");
-  expect(notices).toContain("Jeremy White");
 });
 
 test("zero runtime dependencies", () => {
