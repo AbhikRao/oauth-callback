@@ -529,7 +529,7 @@ class Session {
   async #tokens(): Promise<StoredOAuthTokens | undefined> {
     const { tokens } = await this.credentials.read();
     if (!tokens) return undefined;
-    const { client_id, ...rest } = tokens;
+    const { client_id: _clientId, ...rest } = tokens;
     const client = await this.#clientInformation();
     return client && ownsTokens(client, tokens) ? rest : undefined;
   }
@@ -692,10 +692,10 @@ function resolveConfig(options: BrowserAuthOptions): Config {
   // Adapter-owned fields go last so untyped callers can't override them. grant_types and
   // application_type are left to the SDK's DCR defaults (no forced offline_access).
   const {
-    client_name,
-    redirect_uris,
-    response_types,
-    application_type,
+    client_name: _clientName,
+    redirect_uris: _redirectUris,
+    response_types: _responseTypes,
+    application_type: _applicationType,
     ...extra
   } = clientMetadata as Partial<OAuthClientMetadata>;
   const metadata: OAuthClientMetadata = {

@@ -16,7 +16,8 @@ bun run test          # Unit + MCP e2e tests
 bun run test:runtimes # Smoke-test the build on Node, Deno and Bun
 bun run typecheck     # Check TypeScript types
 bun run format        # Format with Prettier
-bun run validate      # Run all checks (format, typecheck, test, build, publint)
+bun run lint          # Lint source, tests, examples, and scripts with Oxlint
+bun run validate      # Run all checks (format, lint, typecheck, test, build, publint)
 bun run docs:dev      # Documentation site
 ```
 

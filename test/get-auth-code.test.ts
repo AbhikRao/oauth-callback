@@ -349,7 +349,7 @@ describe("options", () => {
 
   test("launch accepts functions returning anything", () => {
     // Type-level: both must compile.
-    const open = (_: string) => Promise.resolve({ pid: 1 });
+    const open = (_url: string) => Promise.resolve({ pid: 1 });
     const options: Parameters<typeof getAuthCode>[1][] = [
       { launch: (url) => open(url.href) },
       { launch: (url) => console.log(url) },
